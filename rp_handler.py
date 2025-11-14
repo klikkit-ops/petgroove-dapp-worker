@@ -5,8 +5,8 @@ import requests
 import runpod
 
 # -------------------- config --------------------
-A1111_PORT = os.getenv("A1111_PORT", "3001")  # use 3001 so it won't clash with any background 3000
-JOB_TIMEOUT_SECS = int(os.getenv("DEFORUM_JOB_TIMEOUT", "900"))  # per job timeout (seconds)
+A1111_PORT = os.getenv("A1111_PORT", "3001")  # avoid clash with background 3000
+JOB_TIMEOUT_SECS = int(os.getenv("DEFORUM_JOB_TIMEOUT", "900"))
 A1111_ROOT = "/workspace/stable-diffusion-webui"
 VENVPY = f"{A1111_ROOT}/venv/bin/python"
 LAUNCH = f"{A1111_ROOT}/launch.py"
@@ -17,7 +17,6 @@ def _jsonlog(event: str, **fields):
     try:
         print(json.dumps(rec, ensure_ascii=False))
     except Exception:
-        # never crash on logging
         print(f"[log-fallback] {event} {fields}")
 
 def _tail(txt: str, n: int = 1600) -> str:
@@ -41,9 +40,6 @@ def make_timer():
 
 # -------------------- schedules & outputs --------------------
 def _schedule(val, default_str: str) -> str:
-    """
-    Deforum expects schedule STRINGS like '0:(0.75)'. Never None.
-    """
     if val is None or val == "":
         return default_str
     if isinstance(val, (int, float)):
@@ -93,8 +89,8 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
 # -------------------- job builder --------------------
 def build_deforum_job(inp: dict) -> dict:
     """
-    Minimal, safe Deforum config. ControlNet schedules are always strings to avoid NoneType.split errors.
-    For smoke tests we keep everything small & fast.
+    Minimal, safe Deforum config. For smoke tests, ControlNet is OMITTED entirely unless enabled.
+    (If present but disabled, Deforum still tries to parse schedules and can crash.)
     """
     prompt = inp.get("prompt", "a simple colored shape on a plain background")
     max_frames = int(inp.get("max_frames", 8))
@@ -103,25 +99,6 @@ def build_deforum_job(inp: dict) -> dict:
     seed = int(inp.get("seed", 1))
     steps = int(inp.get("steps", 15))
     fps = int(inp.get("fps", 8))
-
-    controlnet_args = {
-        "enabled": bool(inp.get("controlnet_enabled", False)),
-        "controlnet_model": inp.get("controlnet_model", "control_sd15_animal_openpose_fp16"),
-        "controlnet_preprocessor": inp.get("controlnet_preprocessor", "openpose_full"),
-        "controlnet_pixel_perfect": True,
-        "controlnet_strength":              _schedule(inp.get("cn_strength"), "0:(0.85)"),
-        "image_strength":                   _schedule(inp.get("cn_image_strength"), "0:(0.75)"),
-        "controlnet_start":                 _schedule(inp.get("cn_start"), "0:(0.0)"),
-        "controlnet_end":                   _schedule(inp.get("cn_end"), "0:(1.0)"),
-        "controlnet_annotator_resolution":  _schedule(inp.get("cn_annotator_res"), "0:(512)"),
-        "guess_mode":                       _schedule(inp.get("cn_guess_mode"), "0:(0)"),
-        "threshold_a":                      _schedule(inp.get("cn_threshold_a"), "0:(64)"),
-        "threshold_b":                      _schedule(inp.get("cn_threshold_b"), "0:(64)"),
-        "softness":                         _schedule(inp.get("cn_softness"), "0:(0.0)"),
-        "processor_res":                    _schedule(inp.get("cn_processor_res"), "0:(512)"),
-        "weight":                           _schedule(inp.get("cn_weight"), "0:(1.0)"),
-        "prev_frame_controlnet": False,
-    }
 
     job = {
         "prompt": {"0": prompt},
@@ -150,24 +127,37 @@ def build_deforum_job(inp: dict) -> dict:
         "save_video": True,
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
-        # ControlNet (disabled by default)
-        "controlnet_args": controlnet_args,
     }
+
+    # --- Only include ControlNet block if explicitly enabled ---
+    if bool(inp.get("controlnet_enabled", False)):
+        # Use Deforum's expected key names:
+        controlnet_args = {
+            "enabled": True,
+            "controlnet_module": inp.get("controlnet_module", "openpose_full"),           # preprocessor
+            "controlnet_model": inp.get("controlnet_model", "control_sd15_animal_openpose_fp16"),
+            "controlnet_pixel_perfect": True,
+            # schedules:
+            "controlnet_weight":            _schedule(inp.get("cn_weight"), "0:(1.0)"),
+            "controlnet_guidance_start":    _schedule(inp.get("cn_start"),  "0:(0.0)"),
+            "controlnet_guidance_end":      _schedule(inp.get("cn_end"),    "0:(1.0)"),
+            "controlnet_detect_resolution": _schedule(inp.get("cn_res"),    "0:(512)"),
+            "guess_mode":                   _schedule(inp.get("cn_guess"),  "0:(0)"),
+            "threshold_a":                  _schedule(inp.get("cn_th_a"),   "0:(64)"),
+            "threshold_b":                  _schedule(inp.get("cn_th_b"),   "0:(64)"),
+            "softness":                     _schedule(inp.get("cn_soft"),   "0:(0.0)"),
+        }
+        job["controlnet_args"] = controlnet_args
+    # else: omit controlnet_args entirely
 
     return job
 
 # -------------------- CLI runner --------------------
 def run_deforum_cli(job: dict, timeout_sec: int = None):
-    """
-    Launch Deforum via launch.py --deforum-run-now <job.json> and return {retcode, tail, outdir}.
-    Uses port 3001 by default to avoid clashes.
-    If CKPT_PATH points to an existing file, add --no-download-sd-model --ckpt <file> --skip-install.
-    """
     timeout_sec = timeout_sec or JOB_TIMEOUT_SECS
     out_dir = job.get("outdir", "/workspace/outputs/deforum")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Write job config
     cfg = tempfile.NamedTemporaryFile("w", delete=False, suffix=".json")
     json.dump(job, cfg)
     cfg.close()
@@ -185,7 +175,6 @@ def run_deforum_cli(job: dict, timeout_sec: int = None):
         "--deforum-run-now", cfg.name,
         "--deforum-terminate-after-run-now",
     ]
-
     if ckpt_exists:
         cmd += ["--no-download-sd-model", "--ckpt", ckpt, "--skip-install"]
 
@@ -226,7 +215,6 @@ def handler(event):
 
     @timed("run_cli")
     def _run(job):
-        # allow per-request override (ms)
         req_timeout_ms = inp.get("timeout_ms")
         req_timeout = int(req_timeout_ms / 1000) if isinstance(req_timeout_ms, (int, float)) else None
         return run_deforum_cli(job, timeout_sec=req_timeout)
