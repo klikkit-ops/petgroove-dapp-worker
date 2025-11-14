@@ -51,19 +51,20 @@ popd >/dev/null
 # -----------------------------
 # Wait for API
 # -----------------------------
-python - <<'PY'
-import time, requests, sys
-url = "http://127.0.0.1:3000/sdapi/v1/sd-models"
-for i in range(360):  # up to ~6 minutes on a cold start
-    try:
-        requests.get(url, timeout=3)
-        print("[start] A1111 API is ready")
-        sys.exit(0)
-    except Exception:
-        time.sleep(1)
-print("[start] ERROR: A1111 API did not start in time", file=sys.stderr)
-sys.exit(1)
-PY
+echo "[start] Waiting for A1111 API..."
+url="http://127.0.0.1:3000/sdapi/v1/sd-models"
+
+for i in {1..360}; do # up to ~6 minutes
+    if curl -s --head --fail "$url" > /dev/null; then
+        echo "[start] A1111 API is ready"
+        break
+    fi
+    sleep 1
+    if [ $i -eq 360 ]; then
+        echo "[start] ERROR: A1111 API did not start in time" >&2
+        exit 1
+    fi
+done
 
 # -----------------------------
 # Optional: list routes to verify deforum endpoints quickly
