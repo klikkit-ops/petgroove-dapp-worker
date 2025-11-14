@@ -1,41 +1,85 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-echo "Worker Initiated"
+cd /workspace
 
-echo "Symlinking files from Network Volume"
-rm -rf /workspace && \
-  ln -s /runpod-volume /workspace
+# -----------------------------
+# WebUI args
+# -----------------------------
+export COMMANDLINE_ARGS="${WEBUI_ARGS:-"--api --listen --xformers --enable-insecure-extension-access --port 3000"}"
+export LAUNCH_BROWSER=0
+echo "[start] COMMANDLINE_ARGS=${COMMANDLINE_ARGS}"
 
-if [ -f "/workspace/venv/bin/activate" ]; then
-    echo "Starting WebUI API"
-    source /workspace/venv/bin/activate
-    TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
-    export LD_PRELOAD="${TCMALLOC}"
-    export PYTHONUNBUFFERED=true
-    export HF_HOME="/workspace"
-    python3 /workspace/stable-diffusion-webui/webui.py \
-      --xformers \
-      --no-half-vae \
-      --skip-python-version-check \
-      --skip-torch-cuda-test \
-      --skip-install \
-      --lowram \
-      --opt-sdp-attention \
-      --disable-safe-unpickle \
-      --port 3000 \
-      --api \
-      --nowebui \
-      --skip-version-check \
-      --no-hashing \
-      --no-download-sd-model > /workspace/logs/webui.log 2>&1 &
-    deactivate
-else
-    echo "ERROR: The Python Virtual Environment (/workspace/venv/bin/activate) could not be activated"
-    echo "1. Ensure that you have followed the instructions at: https://github.com/ashleykleynhans/runpod-worker-a1111/blob/main/docs/installing.md"
-    echo "2. Ensure that you have used the Pytorch image for the installation and NOT a Stable Diffusion image."
-    echo "3. Ensure that you have attached your Network Volume to your endpoint."
-    echo "4. Ensure that you didn't assign any other invalid regions to your endpoint."
+# -----------------------------
+# Ensure repos exist
+# -----------------------------
+if [[ ! -d /workspace/stable-diffusion-webui ]]; then
+  echo "[start] Cloning AUTOMATIC1111 repo…"
+  git clone --depth 1 https://github.com/AUTOMATIC1111/stable-diffusion-webui /workspace/stable-diffusion-webui
 fi
 
-echo "Starting RunPod Handler"
-python3 -u /rp_handler.py
+# Deforum (safety net; Dockerfile clones it already)
+DEF_EXT="/workspace/stable-diffusion-webui/extensions/sd-webui-deforum"
+if [[ ! -d "$DEF_EXT" ]]; then
+  echo "[start] Cloning Deforum extension…"
+  git clone --depth 1 https://github.com/deforum-art/sd-webui-deforum "$DEF_EXT" || true
+fi
+
+# ControlNet (safety net; Dockerfile clones it already)
+CN_EXT="/workspace/stable-diffusion-webui/extensions/sd-webui-controlnet"
+if [[ ! -d "$CN_EXT" ]]; then
+  echo "[start] Cloning ControlNet extension…"
+  git clone --depth 1 https://github.com/Mikubill/sd-webui-controlnet "$CN_EXT" || true
+fi
+
+# If Deforum exposes deforum_api.py, make it visible to A1111
+if [[ -f "$DEF_EXT/scripts/deforum_api.py" ]]; then
+  cp -f "$DEF_EXT/scripts/deforum_api.py" /workspace/stable-diffusion-webui/scripts/ || true
+fi
+
+# -----------------------------
+# Launch A1111 using system Python so it uses its OWN venv
+# (prewarmed in Docker build). Do NOT activate /workspace/venv here.
+# -----------------------------
+pushd /workspace/stable-diffusion-webui >/dev/null
+echo "[start] Launching A1111…"
+# Pass a hint to prefer binary wheels
+export PIP_PREFER_BINARY=1
+/usr/bin/python3 launch.py ${COMMANDLINE_ARGS} &
+popd >/dev/null
+
+# -----------------------------
+# Wait for API
+# -----------------------------
+python - <<'PY'
+import time, requests, sys
+url = "http://127.0.0.1:3000/sdapi/v1/sd-models"
+for i in range(360):  # up to ~6 minutes on a cold start
+    try:
+        requests.get(url, timeout=3)
+        print("[start] A1111 API is ready")
+        sys.exit(0)
+    except Exception:
+        time.sleep(1)
+print("[start] ERROR: A1111 API did not start in time", file=sys.stderr)
+sys.exit(1)
+PY
+
+# -----------------------------
+# Optional: list routes to verify deforum endpoints quickly
+# -----------------------------
+( curl -s http://127.0.0.1:3000/openapi.json | jq -r 'try .paths | keys[] catch empty' | sed 's/^/[route] /' ) || true
+
+# -----------------------------
+# NOW activate the worker venv just for the RunPod handler
+# -----------------------------
+if [[ ! -d /workspace/venv ]]; then
+  echo "[start] Creating worker venv…"
+  python3 -m venv /workspace/venv
+fi
+# shellcheck disable=SC1091
+source /workspace/venv/bin/activate
+pip install --no-cache-dir -q runpod==1.7.7 requests imageio imageio-ffmpeg pillow || true
+
+echo "[start] Starting RunPod worker…"
+exec python /workspace/rp_handler.py

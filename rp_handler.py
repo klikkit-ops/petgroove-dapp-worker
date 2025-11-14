@@ -1,358 +1,239 @@
-import os
-import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+# rp_handler.py — Deforum runner with safe ControlNet schedules + optional Vercel Blob upload
+import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
+from pathlib import Path
 import requests
-import traceback
 import runpod
-from runpod.serverless.utils.rp_validator import validate
-from runpod.serverless.modules.rp_logger import RunPodLogger
-from requests.adapters import HTTPAdapter, Retry
-from huggingface_hub import HfApi
-from schemas.input import INPUT_SCHEMA
-from schemas.api import API_SCHEMA
-from schemas.img2img import IMG2IMG_SCHEMA
-from schemas.txt2img import TXT2IMG_SCHEMA
-from schemas.interrogate import INTERROGATE_SCHEMA
-from schemas.sync import SYNC_SCHEMA
-from schemas.download import DOWNLOAD_SCHEMA
 
-BASE_URI: str = 'http://127.0.0.1:3000'
-TIMEOUT: int = 600
-POST_RETRIES: int = 3
+A1111 = "http://127.0.0.1:3000"
 
-session = requests.Session()
-retries = Retry(total=10, backoff_factor=0.1, status_forcelist=[502, 503, 504])
-session.mount('http://', HTTPAdapter(max_retries=retries))
-logger = RunPodLogger()
+# ---------- tiny helpers ----------
+def _tail(txt: str, n: int = 1200) -> str:
+    return (txt or "")[-n:]
 
-
-# ---------------------------------------------------------------------------- #
-#                               Utility Functions                              #
-# ---------------------------------------------------------------------------- #
-def wait_for_service(url: str) -> None:
+def _schedule(val, default_str: str) -> str:
     """
-    Wait for a service to become available by repeatedly polling the URL.
-
-    Args:
-        url: The URL to check for service availability.
+    Deforum expects schedule STRINGS like '0:(0.75)'. Never None.
+    - number -> "0:(number)"
+    - blank/None -> default_str
+    - string without schedule syntax -> wrap as "0:(string)"
     """
-    retries = 0
+    if val is None or val == "":
+        return default_str
+    if isinstance(val, (int, float)):
+        return f"0:({val})"
+    s = str(val).strip()
+    if ":" in s and "(" in s and ")" in s:
+        return s
+    return f"0:({s})"
 
-    while True:
-        try:
-            requests.get(url)
-            return
-        except requests.exceptions.RequestException:
-            retries += 1
+def newest_video(paths):
+    cand = []
+    for p in paths:
+        cand.extend(glob.glob(os.path.join(p, "**", "*.mp4"), recursive=True))
+        cand.extend(glob.glob(os.path.join(p, "**", "*.webm"), recursive=True))
+        cand.extend(glob.glob(os.path.join(p, "**", "*.mov"), recursive=True))
+    if not cand:
+        return None
+    cand.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
+    return cand[0]
 
-            # Only log every 15 retries so the logs don't get spammed
-            if retries % 15 == 0:
-                logger.info('Service not ready yet. Retrying...')
-        except Exception as err:
-            logger.error(f'Error: {err}')
+def upload_to_vercel_blob(file_path: str, run_id: str):
+    base = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")
+    token = (os.getenv("VERCEL_BLOB_RW_TOKEN")
+             or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN")
+             or os.getenv("VERCEL_BLOB_TOKEN"))
+    if not base or not token:
+        return {"ok": False, "reason": "missing_env"}
+    path = Path(file_path)
+    if not path.exists():
+        return {"ok": False, "reason": "file_missing"}
+    key = f"runs/{run_id}/{path.name}"
+    url = f"{base.rstrip('/')}/?pathname={requests.utils.quote(key, safe='')}"
+    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    with path.open("rb") as f:
+        r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype},
+                         data=f.read(), timeout=180)
+    if r.status_code not in (200, 201):
+        body = _tail(r.text, 400)
+        return {"ok": False, "reason": f"upload_http_{r.status_code}", "body": body}
+    try:
+        body = r.json()
+    except Exception:
+        body = {"url": r.text}
+    return {"ok": True, "url": body.get("url") or url, "key": key}
 
-        time.sleep(0.2)
-
-
-def send_get_request(endpoint: str) -> requests.Response:
+# ---------- job builder ----------
+def build_deforum_job(inp: dict) -> dict:
     """
-    Send a GET request to the specified endpoint.
-
-    Args:
-        endpoint: The API endpoint to send the request to.
-
-    Returns:
-        The response from the server.
+    Minimal Deforum config that ALWAYS includes a fully-populated controlnet_args
+    with string schedules (and enabled=False) to prevent 'NoneType.split' crashes.
     """
-    return session.get(
-        url=f'{BASE_URI}/{endpoint}',
-        timeout=TIMEOUT
-    )
+    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
+    max_frames = int(inp.get("max_frames", 12))
+    W = int(inp.get("width", 512))
+    H = int(inp.get("height", 512))
+    seed = int(inp.get("seed", 42))
 
+    # ControlNet block: disabled, but every schedule is a STRING.
+    # Keys chosen to match Deforum’s ControlNetKeys & inbetweens parsing.
+    controlnet_args = {
+        "enabled": False,  # stays off for smoke test; set True when you actually want CN
+        "controlnet_model": "control_sd15_animal_openpose_fp16",
+        "controlnet_preprocessor": "openpose_full",
+        "controlnet_pixel_perfect": True,
 
-def send_post_request(endpoint: str, payload: Dict[str, Any], job_id: str, retry: int = 0) -> requests.Response:
-    """
-    Send a POST request to the specified endpoint with retries.
-
-    Args:
-        endpoint: The API endpoint to send the request to.
-        payload: The data to send in the request body.
-        job_id: The ID of the current job for logging.
-        retry: Current retry attempt number.
-
-    Returns:
-        The response from the server.
-    """
-    response = session.post(
-        url=f'{BASE_URI}/{endpoint}',
-        json=payload,
-        timeout=TIMEOUT
-    )
-
-    if response.status_code == 404 and retry < POST_RETRIES:
-        retry += 1
-        logger.warn(f'Received HTTP 404 from endpoint: {endpoint}, Retrying: {retry}', job_id)
-        time.sleep(0.2)
-        return send_post_request(endpoint, payload, job_id, retry)
-
-    return response
-
-
-def validate_input(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate the input payload against the input schema.
-
-    Args:
-        job: The job dictionary containing the input to validate.
-
-    Returns:
-        The validated input or error dictionary.
-    """
-    return validate(job['input'], INPUT_SCHEMA)
-
-
-def validate_api(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate the API configuration against the API schema.
-
-    Args:
-        job: The job dictionary containing the API configuration to validate.
-
-    Returns:
-        The validated API configuration or error dictionary.
-    """
-    api = job['input']['api']
-    api['endpoint'] = api['endpoint'].lstrip('/')
-
-    return validate(api, API_SCHEMA)
-
-
-def extract_scheduler(value: Union[str, int]) -> Tuple[Optional[str], str]:
-    """
-    Extract scheduler suffix from a sampler value if present.
-    Preserves the original case of the value while checking for lowercase suffixes.
-
-    Args:
-        value: The sampler value to check for a scheduler suffix.
-
-    Returns:
-        A tuple containing the scheduler suffix (if found) and the cleaned value.
-    """
-    scheduler_suffixes = ['uniform', 'karras', 'exponential', 'polyexponential', 'sgm_uniform']
-    value_str = str(value)
-    value_lower = value_str.lower()
-
-    for suffix in scheduler_suffixes:
-        if value_lower.endswith(suffix):
-            return suffix, value_str[:-(len(suffix))].rstrip()
-
-    return None, value_str
-
-
-def validate_payload(job: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Validate the payload based on the endpoint and handle sampler/scheduler compatibility.
-
-    Args:
-        job: The job dictionary containing the payload to validate.
-
-    Returns:
-        A tuple containing the endpoint, method, and validated payload.
-    """
-    method = job['input']['api']['method']
-    endpoint = job['input']['api']['endpoint']
-    payload = job['input']['payload']
-    validated_input = payload
-
-    if endpoint in ['sdapi/v1/txt2img', 'sdapi/v1/img2img']:
-        for field in ['sampler_index', 'sampler_name']:
-            if field in payload:
-                scheduler, cleaned_value = extract_scheduler(payload[field])
-                if scheduler:
-                    payload[field] = cleaned_value
-                    payload['scheduler'] = scheduler
-
-    if endpoint == 'v1/sync':
-        logger.info(f'Validating /{endpoint} payload', job['id'])
-        validated_input = validate(payload, SYNC_SCHEMA)
-    elif endpoint == 'v1/download':
-        logger.info(f'Validating /{endpoint} payload', job['id'])
-        validated_input = validate(payload, DOWNLOAD_SCHEMA)
-    elif endpoint == 'sdapi/v1/txt2img':
-        logger.info(f'Validating /{endpoint} payload', job['id'])
-        validated_input = validate(payload, TXT2IMG_SCHEMA)
-    elif endpoint == 'sdapi/v1/img2img':
-        logger.info(f'Validating /{endpoint} payload', job['id'])
-        validated_input = validate(payload, IMG2IMG_SCHEMA)
-    elif endpoint == 'sdapi/v1/interrogate' and method == 'POST':
-        logger.info(f'Validating /{endpoint} payload', job['id'])
-        validated_input = validate(payload, INTERROGATE_SCHEMA)
-
-    return endpoint, job['input']['api']['method'], validated_input
-
-
-def download(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Download a file from a URL to a specified path.
-
-    Args:
-        job: The job dictionary containing the download configuration.
-
-    Returns:
-        A dictionary containing the download status and details.
-    """
-    source_url = job['input']['payload']['source_url']
-    download_path = job['input']['payload']['download_path']
-    process_id = os.getpid()
-    temp_path = f'{download_path}.{process_id}'
-
-    with requests.get(source_url, stream=True) as r:
-        r.raise_for_status()
-        with open(temp_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-
-    os.rename(temp_path, download_path)
-    logger.info(f'{source_url} successfully downloaded to {download_path}', job['id'])
-
-    return {
-        'msg': 'Download successful',
-        'source_url': source_url,
-        'download_path': download_path
+        # SCHEDULES — ALL as strings (never None)
+        "controlnet_strength":              _schedule(inp.get("cn_strength"), "0:(0.85)"),
+        "image_strength":                   _schedule(inp.get("cn_image_strength"), "0:(0.75)"),
+        "controlnet_start":                 _schedule(inp.get("cn_start"), "0:(0.0)"),
+        "controlnet_end":                   _schedule(inp.get("cn_end"), "0:(1.0)"),
+        "controlnet_annotator_resolution":  _schedule(inp.get("cn_annotator_res"), "0:(512)"),
+        "guess_mode":                       _schedule(inp.get("cn_guess_mode"), "0:(0)"),
+        "threshold_a":                      _schedule(inp.get("cn_threshold_a"), "0:(64)"),
+        "threshold_b":                      _schedule(inp.get("cn_threshold_b"), "0:(64)"),
+        "softness":                         _schedule(inp.get("cn_softness"), "0:(0.0)"),
+        "processor_res":                    _schedule(inp.get("cn_processor_res"), "0:(512)"),
+        "weight":                           _schedule(inp.get("cn_weight"), "0:(1.0)"),
+        # Prior-frame control off
+        "prev_frame_controlnet": False,
     }
 
+    # Core deforum args — lean/safe. No Parseq.
+    job = {
+        "prompt": {"0": prompt},
+        "seed": seed,
+        "max_frames": max_frames,
+        "W": W,
+        "H": H,
+        "sampler": "Euler a",
+        "steps": 25,
+        "cfg_scale": 7,
+        "animation_mode": "2D",
+        "fps": 8,
 
-def sync(job: Dict[str, Any]) -> Dict[str, Union[int, List[str]]]:
-    """
-    Sync files from a Hugging Face repository to a local directory.
+        # Common transform schedules as strings
+        "angle": "0:(0)",
+        "zoom": "0:(1.0)",
+        "translation_x": "0:(0)",
+        "translation_y": "0:(0)",
+        "translation_z": "0:(0)",
 
-    Args:
-        job: The job dictionary containing the sync configuration.
+        # No init/video init for smoke test
+        "use_init": False,
+        "init_image": "",
+        "video_init_path": "",
 
-    Returns:
-        A dictionary containing the sync status and details.
-    """
-    repo_id = job['input']['payload']['repo_id']
-    sync_path = job['input']['payload']['sync_path']
-    hf_token = job['input']['payload']['hf_token']
+        # Parseq OFF
+        "use_parseq": False,
 
-    api = HfApi()
-    models = api.list_repo_files(
-        repo_id=repo_id,
-        token=hf_token
-    )
+        # Video output hints (Deforum often respects these)
+        "make_video": True,
+        "save_video": True,
+        "outdir": "/workspace/outputs/deforum",
+        "outdir_video": "/workspace/outputs/deFforum", # Deliberate typo, Deforum uses 'outdir'
 
-    synced_count = 0
-    synced_files = []
-
-    for model in models:
-        folder = os.path.dirname(model)
-        dest_path = f'{sync_path}/{model}'
-
-        if folder and not os.path.exists(dest_path):
-            logger.info(f'Syncing {model} to {dest_path}', job['id'])
-
-            uri = api.hf_hub_download(
-                token=hf_token,
-                repo_id=repo_id,
-                filename=model,
-                local_dir=sync_path,
-                local_dir_use_symlinks=False
-            )
-
-            if uri:
-                synced_count += 1
-                synced_files.append(dest_path)
-
-    return {
-        'synced_count': synced_count,
-        'synced_files': synced_files
+        # Include controlnet_args ALWAYS (disabled but fully-populated)
+        "controlnet_args": controlnet_args,
     }
+    
+    # Fix Deforum output pathing
+    job["outdir_video"] = job["outdir"]
 
+    # If caller explicitly enables CN, flip the toggle but keep schedules
+    cn = inp.get("controlnet") or {}
+    if isinstance(cn, dict) and cn.get("enabled") is True:
+        job["controlnet_args"]["enabled"] = True
+        # allow overrides
+        for k, v in [
+            ("controlnet_model", cn.get("model")),
+            ("controlnet_preprocessor", cn.get("preprocessor")),
+        ]:
+            if v:
+                job["controlnet_args"][k] = v
 
-def handler(job: Dict[str, Any]) -> Dict[str, Any]:
+    return job
+
+# ---------- runner ----------
+def run_deforum(job: dict):
     """
-    Main handler function for processing RunPod jobs.
-
-    Validates input, API configuration, and payload, then processes the request
-    according to the specified endpoint and method.
-
-    Args:
-        job: The job dictionary containing all input data and configuration.
-
-    Returns:
-        A dictionary containing the job results or error information.
+    Runs the Deforum job by sending it to the A1111 API
+    (which was started by start.sh).
     """
-    validated_input = validate_input(job)
+    # The out_dir is defined in the job payload, but we can use it as a fallback
+    out_dir = job.get("outdir", "/workspace/outputs/deforum")
+    os.makedirs(out_dir, exist_ok=True)
 
-    if 'errors' in validated_input:
-        return {
-            'error': '\n'.join(validated_input['errors'])
-        }
-
-    validated_api = validate_api(job)
-
-    if 'errors' in validated_api:
-        return {
-            'error': '\n'.join(validated_api['errors'])
-        }
-
-    endpoint, method, validated_payload = validate_payload(job)
-
-    if 'errors' in validated_payload:
-        return {
-            'error': '\n'.join(validated_payload['errors'])
-        }
-
-    if 'validated_input' in validated_payload:
-        payload = validated_payload['validated_input']
-    else:
-        payload = validated_payload
+    # This is the API endpoint exposed by the Deforum extension
+    api_url = f"{A1111}/sdapi/v1/deforum/run"
+    
+    # The 'job' dictionary you build is the exact payload Deforum expects.
+    payload = job
 
     try:
-        logger.info(f'Sending {method} request to: /{endpoint}', job['id'])
-
-        if endpoint == 'v1/download':
-            return download(job)
-        elif endpoint == 'v1/sync':
-            return sync(job)
-        elif method == 'GET':
-            response = send_get_request(endpoint)
-        elif method == 'POST':
-            response = send_post_request(endpoint, payload, job['id'])
-
+        # Set a long timeout; these jobs can take minutes
+        response = requests.post(api_url, json=payload, timeout=600) 
+        
         if response.status_code == 200:
-            return response.json()
-
-        resp_json = response.json()
-        logger.error(f'HTTP Status code: {response.status_code}', job['id'])
-        logger.error(f'Response: {resp_json}', job['id'])
-
-        if 'error' in resp_json and 'errors' in resp_json:
-            error = resp_json.get('error')
-            errors = resp_json.get('errors')
-            error_msg = f'{error}: {errors}'
+            # A 200 OK from this API means the job *completed*
+            # The response body has info, but we just need to find the video file.
+            return {
+                "retcode": 0,
+                "tail": _tail(json.dumps(response.json()), 2000),
+                "outdir": out_dir,
+            }
         else:
-            error_msg = f'A1111 status code: {response.status_code}'
-
+            # API returned an error (e.g., 422 Unprocessable Entity, 500)
+            return {
+                "retcode": response.status_code,
+                "tail": f"API Error {response.status_code}: {_tail(response.text, 2000)}",
+                "outdir": out_dir,
+            }
+    except requests.exceptions.RequestException as e:
+        # e.g., Connection refused (server not ready), Timeout (job took too long)
         return {
-            'error': error_msg,
-            'output': resp_json,
-            'refresh_worker': True
+            "retcode": 503, # Service Unavailable
+            "tail": f"RequestException: {str(e)}",
+            "outdir": out_dir,
         }
 
-    except Exception as e:
-        logger.error(f'An exception was raised: {e}')
-        return {
-            'error': traceback.format_exc(),
-            'refresh_worker': True
-        }
+# ---------- handler ----------
+def handler(event):
+    run_id = uuid.uuid4().hex[:8]
+    inp = (event or {}).get("input") or {}
 
+    job = build_deforum_job(inp)
+    res = run_deforum(job)
 
-if __name__ == '__main__':
-    wait_for_service(f'{BASE_URI}/sdapi/v1/sd-models')
-    logger.info('A1111 Stable Diffusion API is ready')
-    logger.info('Starting RunPod Serverless...')
-    runpod.serverless.start({
-        'handler': handler
-    })
+    # pick file
+    picked = newest_video([
+        "/workspace/outputs/deforum",
+        "/workspace/stable-diffusion-webui/outputs/deforum",
+        "/workspace/stable-diffusion-webui/outputs",
+    ])
+
+    # optional upload
+    uploaded = {"ok": False, "reason": "no_file_or_missing_env"}
+    if picked and inp.get("upload"):
+        uploaded = upload_to_vercel_blob(picked, run_id)
+
+    env_seen = {
+        "blob_base_set": bool(os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")),
+        "blob_token_set": bool(os.getenv("VERCEL_BLOB_RW_TOKEN") or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN") or os.getenv("VERCEL_BLOB_TOKEN")),
+    }
+
+    ok = (res["retcode"] == 0) and bool(picked)
+    out = {
+        "ok": ok,
+        "mode": "api-call", # Changed from "cli-launch"
+        "run_id": run_id,
+        "local_outdir": res.get("outdir"),
+        "picked_file": picked,
+        "uploaded": uploaded,
+        "env_seen": env_seen,
+    }
+    if not ok:
+        out["launch_tail"] = res.get("tail") # 'tail' now contains API response or error
+
+    return {"status": "COMPLETED" if ok else "FAILED", "result": out}
+
+runpod.serverless.start({"handler": handler})
