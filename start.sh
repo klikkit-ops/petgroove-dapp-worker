@@ -53,7 +53,7 @@ popd >/dev/null
 # Wait for API (12 min timeout)
 # -----------------------------
 echo "[start] Waiting for A1111 API..."
-url="http://0.0.0.0:3000/sdapi/v1/sd-models"
+url="http://127.0.0.1:3000/docs"
 
 for i in {1..720}; do # up to ~12 minutes
     if curl -s --head --fail "$url" > /dev/null; then
