@@ -1,0 +1,54 @@
+# .github/workflows/build.yml
+
+name: Build and Push Docker Image
+
+# --- Triggers ---
+# This action will run automatically on:
+# 1. A push to the 'main' branch
+# 2. A manual run (from the "Actions" tab in GitHub)
+on:
+  push:
+    branches: [ "main" ] # Change this if your main branch is "master"
+  workflow_dispatch:
+
+# --- Jobs ---
+jobs:
+  build-and-push:
+    # Use a fast, native linux/amd64 runner provided by GitHub
+    runs-on: ubuntu-latest 
+
+    # --- Permissions ---
+    # Give the job permission to write to GitHub Packages (GHCR)
+    permissions:
+      contents: read
+      packages: write
+
+    # --- Steps ---
+    steps:
+      # 1. Get your code
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      # 2. Log in to GitHub Container Registry (GHCR)
+      # This uses a special, temporary GITHUB_TOKEN. No secrets needed!
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. Build the image and push it
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          # Tell it to build for RunPod's platform
+          platform: linux/amd64
+          push: true
+          
+          # These are the tags it will create
+          # e.g., ghcr.io/kllk/petgroove-dapp-worker:latest
+          # e.g., ghcr.io/kllk/petgroove-dapp-worker:<git-commit-hash>
+          tags: |
+            ghcr.io/kllk/petgroove-dapp-worker:latest
+            ghcr.io/kllk/petgroove-dapp-worker:${{ github.sha }}
