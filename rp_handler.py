@@ -1,11 +1,12 @@
-# rp_handler.py — Deforum CLI runner with timings, JSON logs, optional CKPT, and Vercel Blob upload
+# rp_handler.py — Deforum CLI runner with safe ControlNet schedules (always strings),
+# timings, optional CKPT, and optional Vercel Blob upload.
 import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
 import requests
 import runpod
 
 # -------------------- config --------------------
-A1111_PORT = os.getenv("A1111_PORT", "3001")  # avoid clash with background 3000
+A1111_PORT = os.getenv("A1111_PORT", "3001")  # avoid clash with any background 3000
 JOB_TIMEOUT_SECS = int(os.getenv("DEFORUM_JOB_TIMEOUT", "900"))
 A1111_ROOT = "/workspace/stable-diffusion-webui"
 VENVPY = f"{A1111_ROOT}/venv/bin/python"
@@ -40,10 +41,9 @@ def make_timer():
 
 # -------------------- schedules & outputs --------------------
 def _schedule(val, default_str: str) -> str:
-    if val is None or val == "":
-        return default_str
-    if isinstance(val, (int, float)):
-        return f"0:({val})"
+    """Deforum expects schedule STRINGS like '0:(0.75)'. Never None."""
+    if val is None or val == "":      return default_str
+    if isinstance(val, (int, float)): return f"0:({val})"
     s = str(val).strip()
     if ":" in s and "(" in s and ")" in s:
         return s
@@ -52,9 +52,9 @@ def _schedule(val, default_str: str) -> str:
 def newest_video(paths):
     cand = []
     for p in paths:
-        cand.extend(glob.glob(os.path.join(p, "**", "*.mp4"), recursive=True))
+        cand.extend(glob.glob(os.path.join(p, "**", "*.mp4"),  recursive=True))
         cand.extend(glob.glob(os.path.join(p, "**", "*.webm"), recursive=True))
-        cand.extend(glob.glob(os.path.join(p, "**", "*.mov"), recursive=True))
+        cand.extend(glob.glob(os.path.join(p, "**", "*.mov"),  recursive=True))
     if not cand:
         return None
     cand.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
@@ -89,16 +89,36 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
 # -------------------- job builder --------------------
 def build_deforum_job(inp: dict) -> dict:
     """
-    Minimal, safe Deforum config. For smoke tests, ControlNet is OMITTED entirely unless enabled.
-    (If present but disabled, Deforum still tries to parse schedules and can crash.)
+    Minimal, safe Deforum config. We ALWAYS include controlnet_args with string schedules so the
+    parser never encounters None. To make ControlNet a no-op in smoke tests, default weight is 0.
     """
-    prompt = inp.get("prompt", "a simple colored shape on a plain background")
+    prompt     = inp.get("prompt", "a simple colored shape on a plain background")
     max_frames = int(inp.get("max_frames", 8))
-    W = int(inp.get("width", 512))
-    H = int(inp.get("height", 512))
-    seed = int(inp.get("seed", 1))
-    steps = int(inp.get("steps", 15))
-    fps = int(inp.get("fps", 8))
+    W          = int(inp.get("width", 512))
+    H          = int(inp.get("height", 512))
+    seed       = int(inp.get("seed", 1))
+    steps      = int(inp.get("steps", 15))
+    fps        = int(inp.get("fps", 8))
+
+    # Full ControlNet block with Deforum's expected key names and STRING schedules
+    # Default weight 0 -> effectively disabled during smoke tests
+    controlnet_args = {
+        # preprocessor + model
+        "controlnet_module":          inp.get("controlnet_module", "openpose_full"),
+        "controlnet_model":           inp.get("controlnet_model", "control_sd15_animal_openpose_fp16"),
+        "controlnet_pixel_perfect":   True,
+        "prev_frame_controlnet":      False,
+
+        # schedules (must be strings)
+        "controlnet_weight":            _schedule(inp.get("cn_weight"), "0:(0.0)"),  # no-op by default
+        "controlnet_guidance_start":    _schedule(inp.get("cn_start"),  "0:(0.0)"),
+        "controlnet_guidance_end":      _schedule(inp.get("cn_end"),    "0:(1.0)"),
+        "controlnet_detect_resolution": _schedule(inp.get("cn_res"),    "0:(512)"),
+        "softness":                     _schedule(inp.get("cn_soft"),   "0:(0.0)"),
+        "threshold_a":                  _schedule(inp.get("cn_th_a"),   "0:(64)"),
+        "threshold_b":                  _schedule(inp.get("cn_th_b"),   "0:(64)"),
+        "guess_mode":                   _schedule(inp.get("cn_guess"),  "0:(0)"),
+    }
 
     job = {
         "prompt": {"0": prompt},
@@ -111,45 +131,36 @@ def build_deforum_job(inp: dict) -> dict:
         "cfg_scale": 7,
         "animation_mode": "2D",
         "fps": fps,
+
         # No motion transforms for smoke
         "angle": "0:(0)",
         "zoom": "0:(1.0)",
         "translation_x": "0:(0)",
         "translation_y": "0:(0)",
         "translation_z": "0:(0)",
+
         # No init/pose for smoke test
         "use_init": False,
         "init_image": "",
         "video_init_path": "",
+
+        # Parseq OFF
         "use_parseq": False,
+
         # Output
         "make_video": True,
         "save_video": True,
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
+
+        # Always include a fully-populated, safe CN block
+        "controlnet_args": controlnet_args,
     }
 
-    # --- Only include ControlNet block if explicitly enabled ---
+    # If caller explicitly wants CN active, give it weight unless overridden
     if bool(inp.get("controlnet_enabled", False)):
-        # Use Deforum's expected key names:
-        controlnet_args = {
-            "enabled": True,
-            "controlnet_module": inp.get("controlnet_module", "openpose_full"),           # preprocessor
-            "controlnet_model": inp.get("controlnet_model", "control_sd15_animal_openpose_fp16"),
-            "controlnet_pixel_perfect": True,
-            # schedules:
-            "controlnet_weight":            _schedule(inp.get("cn_weight"), "0:(1.0)"),
-            "controlnet_guidance_start":    _schedule(inp.get("cn_start"),  "0:(0.0)"),
-            "controlnet_guidance_end":      _schedule(inp.get("cn_end"),    "0:(1.0)"),
-            "controlnet_detect_resolution": _schedule(inp.get("cn_res"),    "0:(512)"),
-            "guess_mode":                   _schedule(inp.get("cn_guess"),  "0:(0)"),
-            "threshold_a":                  _schedule(inp.get("cn_th_a"),   "0:(64)"),
-            "threshold_b":                  _schedule(inp.get("cn_th_b"),   "0:(64)"),
-            "softness":                     _schedule(inp.get("cn_soft"),   "0:(0.0)"),
-        }
-        job["controlnet_args"] = controlnet_args
-    # else: omit controlnet_args entirely
-
+        if inp.get("cn_weight") is None:
+            job["controlnet_args"]["controlnet_weight"] = "0:(1.0)"  # enable effect
     return job
 
 # -------------------- CLI runner --------------------
@@ -158,6 +169,7 @@ def run_deforum_cli(job: dict, timeout_sec: int = None):
     out_dir = job.get("outdir", "/workspace/outputs/deforum")
     os.makedirs(out_dir, exist_ok=True)
 
+    # Write job config
     cfg = tempfile.NamedTemporaryFile("w", delete=False, suffix=".json")
     json.dump(job, cfg)
     cfg.close()
