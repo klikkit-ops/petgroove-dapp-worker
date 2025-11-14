@@ -32,35 +32,36 @@ if [[ ! -d "$CN_EXT" ]]; then
   git clone --depth 1 https://github.com/Mikubill/sd-webui-controlnet "$CN_EXT" || true
 fi
 
-# If Deforum exposes deforum_api.py, make it visible to A1111
-if [[ -f "$DEF_EXT/scripts/deforum_api.py" ]]; then
-  cp -f "$DEF_EXT/scripts/deforum_api.py" /workspace/stable-diffusion-webui/scripts/ || true
-fi
+# --- DELETED BLOCK ---
+# We no longer copy the broken deforum_api.py
 
 # -----------------------------
-# Launch A1111 using system Python so it uses its OWN venv
-# (prewarmed in Docker build). Do NOT activate /workspace/venv here.
+# Launch A1111 using its OWN pre-warmed venv
 # -----------------------------
 pushd /workspace/stable-diffusion-webui >/dev/null
-echo "[start] Launching A1111…"
+echo "[start] Launching A1111 using its pre-warmed venv..."
 # Pass a hint to prefer binary wheels
 export PIP_PREFER_BINARY=1
-/usr/bin/python3 launch.py ${COMMANDLINE_ARGS} &
+# --- THIS IS THE FIX ---
+# We activate the A1111 venv and use its python
+source venv/bin/activate
+python launch.py ${COMMANDLINE_ARGS} &
+# --- END FIX ---
 popd >/dev/null
 
 # -----------------------------
-# Wait for API
+# Wait for API (12 min timeout)
 # -----------------------------
 echo "[start] Waiting for A1111 API..."
 url="http://127.0.0.1:3000/sdapi/v1/sd-models"
 
-for i in {1..360}; do # up to ~6 minutes
+for i in {1..720}; do # up to ~12 minutes
     if curl -s --head --fail "$url" > /dev/null; then
         echo "[start] A1111 API is ready"
         break
     fi
     sleep 1
-    if [ $i -eq 360 ]; then
+    if [ $i -eq 720 ]; then
         echo "[start] ERROR: A1111 API did not start in time" >&2
         exit 1
     fi
