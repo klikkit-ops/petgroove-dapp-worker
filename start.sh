@@ -65,7 +65,7 @@ else:
 PY
 
 # -----------------------------
-# Start RunPod worker (BLOCKS). Use -u for unbuffered logs.
+# Start RunPod worker (BLOCKS). Use -u for unbuffered logs..
 # -----------------------------
 echo "[start] Starting RunPod worker…"
 exec python -u /workspace/rp_handler.py
