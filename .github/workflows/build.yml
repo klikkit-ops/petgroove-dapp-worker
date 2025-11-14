@@ -50,5 +50,5 @@ jobs:
           # e.g., ghcr.io/kllk/petgroove-dapp-worker:latest
           # e.g., ghcr.io/kllk/petgroove-dapp-worker:<git-commit-hash>
           tags: |
-            ghcr.io/kllk/petgroove-dapp-worker:latest
-            ghcr.io/kllk/petgroove-dapp-worker:${{ github.sha }}
+            ghcr.io/klikkit-ops/petgroove-dapp-worker:latest
+            ghcr.io/klikkit-ops/petgroove-dapp-worker:${{ github.sha }}
