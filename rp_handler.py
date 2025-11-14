@@ -1,36 +1,20 @@
-# rp_handler.py — Deforum runner (API-first) with timing + structured logs + route discovery + optional Vercel Blob upload
-import os, json, glob, time, tempfile, requests, mimetypes, uuid
+# rp_handler.py — Deforum CLI runner with timings + optional Vercel Blob upload
+import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
+import requests
 import runpod
 
-A1111 = os.getenv("A1111_BASE_URL", "http://127.0.0.1:3000")
-JOB_TIMEOUT_SECS = int(os.getenv("DEFORUM_JOB_TIMEOUT", "900"))  # up to 15m
-
-# -------------------- logging / timing --------------------
-def log(run_id: str, event: str, **fields):
-    """Single-line JSON log for grep/observability."""
-    rec = {"run_id": run_id, "event": event, **fields}
-    try:
-        print(json.dumps(rec, ensure_ascii=False))
-    except Exception:
-        # never crash logging
-        print(str(rec))
-
-def time_block(run_id: str, label: str):
-    class _Timer:
-        def __enter__(self):
-            self.t0 = time.perf_counter()
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            self.ms = int((time.perf_counter() - self.t0) * 1000)
-            log(run_id, "timing", label=label, elapsed_ms=self.ms)
-    return _Timer()
-
-def _tail(txt: str, n: int = 1200) -> str:
+# ---------- tiny helpers ----------
+def _tail(txt: str, n: int = 1600) -> str:
     return (txt or "")[-n:]
 
-# -------------------- schedules --------------------
 def _schedule(val, default_str: str) -> str:
+    """
+    Deforum expects schedule STRINGS like '0:(0.75)'. Never None.
+    - number -> "0:(number)"
+    - blank/None -> default_str
+    - string without schedule syntax -> wrap as "0:(string)"
+    """
     if val is None or val == "":
         return default_str
     if isinstance(val, (int, float)):
@@ -40,7 +24,6 @@ def _schedule(val, default_str: str) -> str:
         return s
     return f"0:({s})"
 
-# -------------------- outputs --------------------
 def newest_video(paths):
     cand = []
     for p in paths:
@@ -52,7 +35,6 @@ def newest_video(paths):
     cand.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
     return cand[0]
 
-# -------------------- vercel blob --------------------
 def upload_to_vercel_blob(file_path: str, run_id: str):
     base = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")
     token = (os.getenv("VERCEL_BLOB_RW_TOKEN")
@@ -78,8 +60,27 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         body = {"url": r.text}
     return {"ok": True, "url": body.get("url") or url, "key": key}
 
-# -------------------- job builder --------------------
+# ---------- timing decorator ----------
+def make_timer():
+    timings = []
+    def timed(step_name):
+        def deco(fn):
+            def inner(*a, **k):
+                t0 = time.time()
+                try:
+                    return fn(*a, **k)
+                finally:
+                    timings.append({"step": step_name, "ms": int((time.time() - t0) * 1000)})
+            return inner
+        return deco
+    return timings, timed
+
+# ---------- job builder ----------
 def build_deforum_job(inp: dict) -> dict:
+    """
+    Minimal Deforum config that ALWAYS includes a fully-populated controlnet_args
+    with string schedules (and enabled=False) to prevent 'NoneType.split' crashes.
+    """
     prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
     max_frames = int(inp.get("max_frames", 12))
     W = int(inp.get("width", 512))
@@ -87,9 +88,9 @@ def build_deforum_job(inp: dict) -> dict:
     seed = int(inp.get("seed", 42))
 
     controlnet_args = {
-        "enabled": bool((inp.get("controlnet") or {}).get("enabled", False)),
-        "controlnet_model": (inp.get("controlnet") or {}).get("model", "control_sd15_animal_openpose_fp16"),
-        "controlnet_preprocessor": (inp.get("controlnet") or {}).get("preprocessor", "openpose_full"),
+        "enabled": bool(inp.get("controlnet_enabled", False)),
+        "controlnet_model": inp.get("controlnet_model", "control_sd15_animal_openpose_fp16"),
+        "controlnet_preprocessor": inp.get("controlnet_preprocessor", "openpose_full"),
         "controlnet_pixel_perfect": True,
         "controlnet_strength":              _schedule(inp.get("cn_strength"), "0:(0.85)"),
         "image_strength":                   _schedule(inp.get("cn_image_strength"), "0:(0.75)"),
@@ -131,92 +132,103 @@ def build_deforum_job(inp: dict) -> dict:
         "outdir_video": "/workspace/outputs/deforum",
         "controlnet_args": controlnet_args,
     }
+
     return job
 
-# -------------------- API discovery --------------------
-def discover_deforum_run_url(run_id: str):
-    """Try to find the correct /deforum/... run path from /openapi.json."""
-    try:
-        with time_block(run_id, "fetch_openapi_ms"):
-            r = requests.get(f"{A1111}/openapi.json", timeout=10)
-        if r.ok:
-            paths = (r.json() or {}).get("paths", {}) or {}
-            candidates = [p for p in paths.keys() if "deforum" in p.lower() and p.lower().endswith("/run")]
-            if candidates:
-                url = f"{A1111}{candidates[0]}"
-                log(run_id, "discover_ok", discovered=url)
-                return url
-            log(run_id, "discover_none", note="no deforum /run in openapi.json", sample=list(paths.keys())[:10])
-        else:
-            log(run_id, "discover_http", status=r.status_code, body=_tail(r.text, 200))
-    except Exception as e:
-        log(run_id, "discover_error", error=str(e))
-    return None
+# ---------- CLI runner ----------
+def run_deforum_cli(job: dict, timeout_sec: int = None):
+    """
+    Launches Deforum via launch.py --deforum-run-now <job.json> and returns {retcode, tail, outdir}
+    Uses port 3001 to avoid clashing with any background A1111 that start.sh may have on 3000.
+    """
+    timeout_sec = timeout_sec or int(os.getenv("DEFORUM_CLI_TIMEOUT", "900"))
+    out_dir = job.get("outdir", "/workspace/outputs/deforum")
+    os.makedirs(out_dir, exist_ok=True)
 
-def candidate_run_urls():
-    # Known variants across Deforum versions/forks
-    return [
-        "/deforum/run",
-        "/sdapi/v1/deforum/run",
-        "/deforum_api/run",
-        "/sdapi/v1/deforum_api/run",
+    # Write job to temp file
+    tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".json")
+    json.dump(job, tmp)
+    tmp.close()
+
+    py = "/workspace/stable-diffusion-webui/venv/bin/python"
+    launch_py = "/workspace/stable-diffusion-webui/launch.py"
+
+    cmd = [
+        py, launch_py,
+        "--nowebui",
+        "--xformers",
+        "--api",
+        "--enable-insecure-extension-access",
+        "--port", os.getenv("A1111_PORT", "3001"),
+        "--deforum-run-now", tmp.name,
+        "--deforum-terminate-after-run-now",
     ]
 
-# -------------------- runner (API) --------------------
-def run_deforum_via_api(run_id: str, job: dict):
-    tried = []
-    discovered = discover_deforum_run_url(run_id)
-    urls = [discovered] if discovered else []
-    urls += [f"{A1111}{p}" for p in candidate_run_urls()]
-
-    for url in urls:
-        if not url:
-            continue
-        tried.append(url)
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_sec,
+            cwd="/workspace/stable-diffusion-webui",
+            env={**os.environ},
+        )
+        return {
+            "retcode": proc.returncode,
+            "tail": _tail(proc.stdout, 2000),
+            "outdir": out_dir,
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "retcode": 504,
+            "tail": _tail((e.stdout or "") + "\n[TIMEOUT]", 2000),
+            "outdir": out_dir,
+        }
+    except Exception as e:
+        return {
+            "retcode": 500,
+            "tail": f"[EXC] {type(e).__name__}: {e}",
+            "outdir": out_dir,
+        }
+    finally:
         try:
-            with time_block(run_id, f"post_deforum_ms:{url}"):
-                r = requests.post(url, json=job, timeout=JOB_TIMEOUT_SECS)
-            if r.status_code == 404:
-                log(run_id, "deforum_404", url=url)
-                continue
-            if r.ok:
-                # API implementations differ; we don’t rely on response body contents.
-                return {"retcode": 0, "tail": _tail(r.text, 2000), "outdir": job.get("outdir")}
-            else:
-                log(run_id, "deforum_http_error", url=url, status=r.status_code, body=_tail(r.text, 400))
-                # for non-404, still continue to try other candidates
-        except requests.exceptions.RequestException as e:
-            log(run_id, "deforum_req_exc", url=url, error=str(e))
-            continue
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
-    return {
-        "retcode": 404,
-        "tail": f"No working Deforum API route. Tried: {tried}",
-        "outdir": job.get("outdir")
-    }
-
-# -------------------- handler --------------------
+# ---------- handler ----------
 def handler(event):
+    timings, timed = make_timer()
     run_id = uuid.uuid4().hex[:8]
     inp = (event or {}).get("input") or {}
-    log(run_id, "handler_start", input_keys=list(inp.keys()))
 
-    with time_block(run_id, "build_job_ms"):
-        job = build_deforum_job(inp)
+    @timed("build_job")
+    def _build():
+        return build_deforum_job(inp)
 
-    with time_block(run_id, "api_total_ms"):
-        res = run_deforum_via_api(run_id, job)
+    @timed("run_cli")
+    def _run(job):
+        return run_deforum_cli(job)
 
-    picked = newest_video([
-        "/workspace/outputs/deforum",
-        "/workspace/stable-diffusion-webui/outputs/deforum",
-        "/workspace/stable-diffusion-webui/outputs",
-    ])
+    @timed("pick_video")
+    def _pick():
+        return newest_video([
+            "/workspace/outputs/deforum",
+            "/workspace/stable-diffusion-webui/outputs/deforum",
+            "/workspace/stable-diffusion-webui/outputs",
+        ])
 
-    uploaded = {"ok": False, "reason": "no_file_or_missing_env"}
-    if picked and inp.get("upload"):
-        with time_block(run_id, "upload_ms"):
-            uploaded = upload_to_vercel_blob(picked, run_id)
+    @timed("maybe_upload")
+    def _upload(picked):
+        if picked and inp.get("upload"):
+            return upload_to_vercel_blob(picked, run_id)
+        return {"ok": False, "reason": "skipped"}
+
+    job = _build()
+    res = _run(job)
+    picked = _pick()
+    uploaded = _upload(picked)
 
     env_seen = {
         "blob_base_set": bool(os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")),
@@ -226,18 +238,17 @@ def handler(event):
     ok = (res["retcode"] == 0) and bool(picked)
     out = {
         "ok": ok,
-        "mode": "api-call",
+        "mode": "cli-launch",
         "run_id": run_id,
         "local_outdir": res.get("outdir"),
         "picked_file": picked,
         "uploaded": uploaded,
         "env_seen": env_seen,
-        "elapsed_ms": None,  # see timing logs for phase breakdowns
+        "timings": timings,
     }
     if not ok:
         out["launch_tail"] = res.get("tail")
 
-    log(run_id, "handler_end", ok=ok, picked=bool(picked))
     return {"status": "COMPLETED" if ok else "FAILED", "result": out}
 
 runpod.serverless.start({"handler": handler})
