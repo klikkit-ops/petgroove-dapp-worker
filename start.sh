@@ -4,76 +4,18 @@ set -euo pipefail
 cd /workspace
 
 # -----------------------------
-# WebUI args
+# Environment / passthrough
 # -----------------------------
 export COMMANDLINE_ARGS="${WEBUI_ARGS:-"--api --listen --xformers --enable-insecure-extension-access --port 3000"}"
 export LAUNCH_BROWSER=0
+export PYTHONUNBUFFERED=1
+
 echo "[start] COMMANDLINE_ARGS=${COMMANDLINE_ARGS}"
+echo "[start] A1111_PORT(for CLI)=${A1111_PORT:-3001}"
+echo "[start] CKPT_PATH=${CKPT_PATH:-<unset>}"
 
 # -----------------------------
-# Ensure repos exist
-# -----------------------------
-if [[ ! -d /workspace/stable-diffusion-webui ]]; then
-  echo "[start] Cloning AUTOMATIC1111 repo…"
-  git clone --depth 1 https://github.com/AUTOMATIC1111/stable-diffusion-webui /workspace/stable-diffusion-webui
-fi
-
-# Deforum (safety net; Dockerfile clones it already)
-DEF_EXT="/workspace/stable-diffusion-webui/extensions/sd-webui-deforum"
-if [[ ! -d "$DEF_EXT" ]]; then
-  echo "[start] Cloning Deforum extension…"
-  git clone --depth 1 https://github.com/deforum-art/sd-webui-deforum "$DEF_EXT" || true
-fi
-
-# ControlNet (safety net; Dockerfile clones it already)
-CN_EXT="/workspace/stable-diffusion-webui/extensions/sd-webui-controlnet"
-if [[ ! -d "$CN_EXT" ]]; then
-  echo "[start] Cloning ControlNet extension…"
-  git clone --depth 1 https://github.com/Mikubill/sd-webui-controlnet "$CN_EXT" || true
-fi
-
-# --- DELETED BLOCK ---
-# We no longer copy the broken deforum_api.py
-
-# -----------------------------
-# Launch A1111 using its OWN pre-warmed venv
-# -----------------------------
-pushd /workspace/stable-diffusion-webui >/dev/null
-echo "[start] Launching A1111 using its pre-warmed venv..."
-# Pass a hint to prefer binary wheels
-export PIP_PREFER_BINARY=1
-# --- THIS IS THE FIX ---
-# We activate the A1111 venv and use its python
-source venv/bin/activate
-python launch.py ${COMMANDLINE_ARGS} &
-# --- END FIX ---
-popd >/dev/null
-
-# -----------------------------
-# Wait for API (12 min timeout)
-# -----------------------------
-echo "[start] Waiting for A1111 API..."
-url="http://127.0.0.1:3000/docs"
-
-for i in {1..720}; do # up to ~12 minutes
-    if curl -s --head --fail "$url" > /dev/null; then
-        echo "[start] A1111 API is ready"
-        break
-    fi
-    sleep 1
-    if [ $i -eq 720 ]; then
-        echo "[start] ERROR: A1111 API did not start in time" >&2
-        exit 1
-    fi
-done
-
-# -----------------------------
-# Optional: list routes to verify deforum endpoints quickly
-# -----------------------------
-( curl -s http://127.0.0.1:3000/openapi.json | jq -r 'try .paths | keys[] catch empty' | sed 's/^/[route] /' ) || true
-
-# -----------------------------
-# NOW activate the worker venv just for the RunPod handler
+# Python venv for the worker
 # -----------------------------
 if [[ ! -d /workspace/venv ]]; then
   echo "[start] Creating worker venv…"
@@ -81,7 +23,49 @@ if [[ ! -d /workspace/venv ]]; then
 fi
 # shellcheck disable=SC1091
 source /workspace/venv/bin/activate
-pip install --no-cache-dir -q runpod==1.7.7 requests imageio imageio-ffmpeg pillow || true
 
+# -----------------------------
+# Ensure A1111 repo exists
+# -----------------------------
+if [[ ! -d /workspace/stable-diffusion-webui ]]; then
+  echo "[start] Cloning AUTOMATIC1111 repo…"
+  git clone --depth 1 https://github.com/AUTOMATIC1111/stable-diffusion-webui /workspace/stable-diffusion-webui
+fi
+
+# -----------------------------
+# Log available checkpoints (helps diagnose downloads vs baked models)
+# -----------------------------
+echo "[start] Listing baked SD models:"
+ls -lh /workspace/stable-diffusion-webui/models/Stable-diffusion || true
+
+# -----------------------------
+# Start a background A1111 (optional, dev convenience) on :3000
+# -----------------------------
+pushd /workspace/stable-diffusion-webui >/dev/null
+echo "[start] Launching A1111 (background, optional)…"
+# If it fails, we don't want to kill the worker; ignore errors.
+( python launch.py ${COMMANDLINE_ARGS} || true ) &
+popd >/dev/null
+
+# -----------------------------
+# Wait briefly (but don't block the worker)
+# -----------------------------
+python - <<'PY'
+import time, requests
+url = "http://127.0.0.1:3000/sdapi/v1/sd-models"
+for i in range(30):
+    try:
+        requests.get(url, timeout=2)
+        print("[start] A1111 API on :3000 responded.")
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    print("[start] A1111 API on :3000 not ready (continuing anyway).")
+PY
+
+# -----------------------------
+# Start RunPod worker (BLOCKS). Use -u for unbuffered logs.
+# -----------------------------
 echo "[start] Starting RunPod worker…"
-exec python /workspace/rp_handler.py
+exec python -u /workspace/rp_handler.py
