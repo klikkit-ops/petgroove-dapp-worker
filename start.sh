@@ -181,59 +181,47 @@ PY
 # -----------------------------
 # Hotfix Deforum: guard against None in CN schedules + log the offending key
 # -----------------------------
+# -----------------------------
+# Recover Deforum file, then apply a minimal, safe hotfix
+# (prevents NoneType.split without touching function structure)
+# -----------------------------
 python - <<'PY'
-import io, os, re
+import os, subprocess, re, sys
+
+def git_restore():
+    # Revert the file to repo HEAD if it's been modified
+    try:
+        subprocess.run(
+            ["git", "-C", "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum",
+             "checkout", "--", "scripts/deforum_helpers/animation_key_frames.py"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        print("[hotfix] Restored animation_key_frames.py from git (or it was already clean).")
+    except Exception as e:
+        print("[hotfix] Git restore not applied:", e)
 
 p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/animation_key_frames.py"
+
+# 1) Try to restore first (in case a previous patch broke indentation)
+git_restore()
+
 try:
-    with open(p, "r", encoding="utf-8") as f:
-        s = f.read()
-    changed = False
-
-    # Patch parse_inbetweens(...) to coerce None and log which CN key (filename) was None
-    if "HOTFIX_NONE_PARSE_INBETWEENS" not in s:
-        m = re.search(r"(def\s+parse_inbetweens\([^\)]*\):\n)([ \t]+)", s)
-        if m:
-            indent = m.group(2)
-            inject = (
-                m.group(1)
-                + indent + "# HOTFIX_NONE_PARSE_INBETWEENS: default None to neutral schedule\n"
-                + indent + "if value is None:\n"
-                + indent + "    try:\n"
-                + indent + "        print(f\"[deforum-hotfix] parse_inbetweens: {filename} was None → '0:(0)'\", flush=True)\n"
-                + indent + "    except Exception:\n"
-                + indent + "        pass\n"
-                + indent + "    value = '0:(0)'\n"
-            )
-            s = s[:m.start()] + inject + s[m.end():]
-            changed = True
-
-    # Patch parse_key_frames(...) to coerce None and log
-    if "HOTFIX_NONE_PARSE_KEY_FRAMES" not in s:
-        m2 = re.search(r"(def\s+parse_key_frames\([^\)]*\):\n)([ \t]+)", s)
-        if m2:
-            indent2 = m2.group(2)
-            inject2 = (
-                m2.group(1)
-                + indent2 + "# HOTFIX_NONE_PARSE_KEY_FRAMES: default None\n"
-                + indent2 + "if string is None:\n"
-                + indent2 + "    try:\n"
-                + indent2 + "        print(\"[deforum-hotfix] parse_key_frames: received None → '0:(0)'\", flush=True)\n"
-                + indent2 + "    except Exception:\n"
-                + indent2 + "        pass\n"
-                + indent2 + "    string = '0:(0)'\n"
-            )
-            s = s[:m2.start()] + inject2 + s[m2.end():]
-            changed = True
-
-    if changed:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(s)
-        print("[hotfix] Deforum CN scheduler patched for None handling.")
+    s = open(p, "r", encoding="utf-8").read()
+    if "HOTFIX_GUARD_SPLIT" not in s:
+        # Replace the exact split line with a guarded version
+        new = s.replace(
+            'for match_object in string.split(","):',
+            'for match_object in (string if string is not None else "0:(0)").split(","):\n            # HOTFIX_GUARD_SPLIT'
+        )
+        if new != s:
+            open(p, "w", encoding="utf-8").write(new)
+            print("[hotfix] Applied minimal guard to parse_key_frames split loop.")
+        else:
+            print("[hotfix] Target loop not found; no changes made.")
     else:
-        print("[hotfix] Deforum CN scheduler already patched or signatures not found (ok).")
+        print("[hotfix] Minimal guard already present.")
 except Exception as e:
-    print("[hotfix] Patch failed:", e)
+    print("[hotfix] Failed to patch animation_key_frames.py:", e)
 PY
 
 # -----------------------------
