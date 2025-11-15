@@ -1,4 +1,4 @@
-# rp_handler.py — Deforum CLI runner (CN only when enabled) + timing + optional Vercel Blob upload + CN debug keys
+# rp_handler.py — Deforum CLI runner (CN enabled via vid_path) + timing + Vercel Blob upload + CN debug + init_image & negatives
 import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
 import requests
@@ -30,27 +30,21 @@ def newest_video(paths):
     return cand[0]
 
 def upload_to_vercel_blob(file_path: str, run_id: str):
-    """
-    First try a user-provided proxy endpoint (VERCEL_BLOB_PROXY_URL) to avoid DNS issues.
-    If not set or fails, try direct Blob API. Returns attempts for debugging.
-    """
     attempts = []
     path = Path(file_path)
     if not path.exists():
         return {"ok": False, "reason": "file_missing"}
 
-    # Inputs
     api_base  = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE") or "https://api.blob.vercel-storage.com"
-    proxy_url = os.getenv("VERCEL_BLOB_PROXY_URL")  # e.g. https://your-app.vercel.app/api/blob-upload
+    proxy_url = os.getenv("VERCEL_BLOB_PROXY_URL")
     token     = (os.getenv("VERCEL_BLOB_RW_TOKEN")
                  or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN")
                  or os.getenv("VERCEL_BLOB_TOKEN"))
-    public_base = os.getenv("VERCEL_BLOB_PUBLIC_BASE")  # optional, to synthesize a public URL
+    public_base = os.getenv("VERCEL_BLOB_PUBLIC_BASE")
 
     key = f"runs/{run_id}/{path.name}"
     ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
-    # 1) Try proxy first (POST binary to your domain)
     if proxy_url:
         try:
             with path.open("rb") as f:
@@ -67,7 +61,6 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         except Exception as e:
             attempts.append({"method": "proxy", "error": str(e)})
 
-    # 2) Fall back to direct Blob API
     if not token:
         return {"ok": False, "reason": "missing_env", "attempts": attempts}
 
@@ -82,7 +75,6 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
                     timeout=180,
                 )
             if r.status_code in (200, 201):
-                # Prefer API JSON url; otherwise synthesize a public URL if available
                 try:
                     body = r.json()
                 except Exception:
@@ -108,9 +100,7 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
 
 # ---------- CN: discover & resolve ----------
 def _get_cn_lists():
-    """Return (models, modules) discovered from A1111 ControlNet endpoints."""
     models, modules = set(), set()
-    # /controlnet/model_list
     try:
         j = requests.get(f"{A1111}/controlnet/model_list", timeout=5).json()
         lst = j.get("model_list") if isinstance(j, dict) else j
@@ -118,7 +108,6 @@ def _get_cn_lists():
             models.update(lst)
     except Exception:
         pass
-    # /controlnet/module_list
     try:
         j = requests.get(f"{A1111}/controlnet/module_list", timeout=5).json()
         lst = j.get("module_list") if isinstance(j, dict) else j
@@ -129,19 +118,10 @@ def _get_cn_lists():
     return sorted(models), sorted(modules)
 
 def _resolve_cn(model_in: "str | None", module_in: "str | None"):
-    """
-    Pick the best ControlNet model/module available.
-    Priority:
-      1) Env overrides CN_MODEL_NAME / CN_MODULE_NAME
-      2) Provided values
-      3) Sensible fallbacks present in the discovered lists
-    """
     prefer_model = os.getenv("CN_MODEL_NAME") or model_in or "control_sd15_animal_openpose_fp16"
-    prefer_module = os.getenv("CN_MODULE_NAME") or module_in or "openpose_full"
-
+    prefer_module = os.getenv("CN_MODULE_NAME") or module_in or "animal_openpose"
     avail_models, avail_modules = _get_cn_lists()
 
-    # Model resolution
     model = prefer_model
     if avail_models and model not in avail_models:
         for cand in (prefer_model, "control_sd15_animal_openpose_fp16", "control_v11p_sd15_openpose"):
@@ -149,7 +129,6 @@ def _resolve_cn(model_in: "str | None", module_in: "str | None"):
                 model = cand
                 break
 
-    # Module resolution
     module = prefer_module
     if avail_modules and module not in avail_modules:
         for cand in (prefer_module, "animal_openpose", "openpose_full", "openpose"):
@@ -161,10 +140,6 @@ def _resolve_cn(model_in: "str | None", module_in: "str | None"):
 
 # ---------- Deforum job builder ----------
 def build_deforum_job(inp: dict) -> dict:
-    """
-    Build a Deforum config using the key names your Deforum build expects.
-    All schedule-like fields are string schedules to avoid NoneType.split.
-    """
     def S(x, default_str):
         if x is None or x == "":
             return default_str
@@ -173,44 +148,42 @@ def build_deforum_job(inp: dict) -> dict:
         s = str(x).strip()
         return s if (":" in s and "(" in s and ")" in s) else f"0:({s})"
 
-    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing the robot, same cat across frames, natural balance, consistent anatomy")
-    max_frames = int(inp.get("max_frames", 16))
+    # basics
+    prompt = inp.get("prompt", "photorealistic cat dancing on the spot, consistent anatomy, one head, four legs, one tail, natural balance")
+    negative = inp.get("negative_prompt") or inp.get("negative") or "text, letters, logo, watermark, border, poster, extra limbs, deformed, low quality, blurry"
     W = int(inp.get("width", 512))
     H = int(inp.get("height", 512))
+    fps  = int(inp.get("fps", 12))
+    seconds = int(inp.get("seconds", 8))
+    max_frames = int(inp.get("max_frames", seconds * fps))
     seed = int(inp.get("seed", 42))
-    fps  = int(inp.get("fps", 8))
 
-    # ---- ControlNet (Deforum expects cn_1_* keys) ----
+    # init image (pet photo)
+    init_image = inp.get("init_image") or inp.get("image_url") or ""
+    use_init = bool(init_image)
+    image_strength = float(inp.get("image_strength", 0.60))
+
+    # ControlNet
     cn = inp.get("controlnet") or {}
     cn_enabled = bool(cn.get("enabled", False))
     cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
-
-    # Resolve model/module against what A1111 advertises (with env overrides)
     resolved_model, resolved_module, _models, _modules = _resolve_cn(
         cn.get("model"), cn.get("module")
     )
 
     controlnet_args = {
-        # required toggles/ids
         "cn_1_enabled": cn_enabled,
         "cn_1_model": resolved_model,
-        "cn_1_module": resolved_module,  # auto-resolved
-
-        # schedules (must be strings)
-        "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
+        "cn_1_module": resolved_module,
+        "cn_1_weight": S(cn.get("weight"), "0:(0.95)"),
         "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
         "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
         "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
-
-        # send BOTH, to satisfy either commit lineage
-        "cn_1_processor_res": S(cn.get("processor_res"), "0:(512)"),
-        "cn_1_annotator_resolution": S(cn.get("annotator_resolution"), "0:(512)"),
-
+        "cn_1_processor_res": S(cn.get("processor_res"), "0:(640)"),
+        "cn_1_annotator_resolution": S(cn.get("annotator_resolution"), "0:(640)"),
         "cn_1_threshold_a": S(cn.get("threshold_a"), "0:(64)"),
         "cn_1_threshold_b": S(cn.get("threshold_b"), "0:(64)"),
         "cn_1_guess_mode": S(cn.get("guess_mode"), "0:(0)"),
-
-        # enums / booleans (not schedules)
         "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
         "cn_1_control_mode": cn.get("control_mode", "Balanced"),
         "cn_1_low_vram": bool(cn.get("low_vram", False)),
@@ -224,32 +197,38 @@ def build_deforum_job(inp: dict) -> dict:
     if cn_1_vid_path:
         controlnet_args["cn_1_vid_path"] = cn_1_vid_path
 
-    # ---- Core Deforum (lean & safe) ----
+    # core deforum
     job = {
+        # Prompts (support both key names across Deforum versions)
+        "prompts": {"0": prompt},
         "prompt": {"0": prompt},
+        "negative_prompts": {"0": negative},
+        "negative_prompt": {"0": negative},
+
         "seed": seed,
         "max_frames": max_frames,
         "W": W,
         "H": H,
         "fps": fps,
         "sampler": "Euler a",
-        "steps": 25,
-        "cfg_scale": 7,
+        "steps": int(inp.get("steps", 28)),
+        "cfg_scale": float(inp.get("cfg_scale", 6.5)),
         "animation_mode": "2D",
 
-        # transforms as schedules
+        # transforms
         "angle": "0:(0)",
         "zoom": "0:(1.0)",
         "translation_x": "0:(0)",
         "translation_y": "0:(0)",
         "translation_z": "0:(0)",
 
-        # init OFF for smoke tests
-        "use_init": False,
-        "init_image": "",
-        "video_init_path": "",
+        # init (pet identity)
+        "use_init": use_init,
+        "init_image": init_image,
+        "image_strength_schedule": S(inp.get("image_strength_schedule"), f"0:({image_strength})"),
+        "strength_schedule": S(inp.get("strength_schedule"), f"0:({image_strength})"),
 
-        # no parseq
+        # parseq off
         "use_parseq": False,
 
         # outputs
@@ -258,7 +237,7 @@ def build_deforum_job(inp: dict) -> dict:
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
 
-        # attach CN args
+        # ControlNet
         "controlnet_args": controlnet_args,
     }
 
@@ -277,9 +256,6 @@ def run_via_launch(job: dict, timings: list):
     venv_py = "/workspace/stable-diffusion-webui/venv/bin/python"
     webui = "/workspace/stable-diffusion-webui"
 
-    # Use a different port for the CLI run to avoid colliding with the background A1111 in start.sh
-    cli_port = os.getenv("A1111_PORT", "3001")
-
     args = [
         venv_py, os.path.join(webui, "launch.py"),
         "--nowebui", "--skip-install",
@@ -287,7 +263,7 @@ def run_via_launch(job: dict, timings: list):
         "--deforum-terminate-after-run-now",
         "--api", "--listen", "--xformers",
         "--enable-insecure-extension-access",
-        "--port", cli_port,
+        "--port", "3000",
     ]
     env = os.environ.copy()
     proc = subprocess.run(args, cwd=webui, env=env,
@@ -328,6 +304,8 @@ def handler(event):
     }
 
     ok = (res["retcode"] == 0) and bool(picked)
+    models_list, modules_list = _get_cn_lists()
+
     out = {
         "ok": ok,
         "mode": "cli-launch",
@@ -338,15 +316,11 @@ def handler(event):
         "env_seen": env_seen,
         "timings": timings,
         "total_elapsed_ms": int((time.time() - handler_start) * 1000),
+        "debug_available_cn_models": models_list,
+        "debug_available_cn_modules": modules_list,
     }
-    # Expose what A1111 reported so we can see if names mismatched
-    models_list, modules_list = _get_cn_lists()
-    out["debug_available_cn_models"] = models_list
-    out["debug_available_cn_modules"] = modules_list
-
     if not ok:
         out["launch_tail"] = res.get("tail")
-        # 🔎 Include CN keys/values to see exactly what we sent
         cn = job.get("controlnet_args")
         if cn:
             out["debug_cn_keys"] = sorted(list(cn.keys()))
@@ -355,7 +329,6 @@ def handler(event):
                 for k in out["debug_cn_keys"]
             }
     elif inp.get("debug"):
-        # Optional: include CN keys on success when input.debug=true
         cn = job.get("controlnet_args")
         if cn:
             out["debug_cn_keys"] = sorted(list(cn.keys()))
