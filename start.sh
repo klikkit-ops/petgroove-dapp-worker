@@ -13,6 +13,7 @@ export PYTHONUNBUFFERED=1
 echo "[start] COMMANDLINE_ARGS=${COMMANDLINE_ARGS}"
 echo "[start] A1111_PORT(for CLI)=${A1111_PORT:-3001}"
 echo "[start] CKPT_PATH=${CKPT_PATH:-<unset>}"
+echo "[start] FORCE_DISABLE_CN=${FORCE_DISABLE_CN:-0}"
 
 # -----------------------------
 # Python venv for the worker
@@ -48,6 +49,33 @@ if [[ ! -d "$CN_EXT" ]]; then
   git clone --depth 1 https://github.com/Mikubill/sd-webui-controlnet "$CN_EXT" || true
 fi
 mkdir -p "$CN_EXT/models"
+
+# -----------------------------
+# *** Hard-disable ControlNet if requested ***
+# (prevents NoneType.split crashes inside Deforum's CN parser)
+# Toggle by setting FORCE_DISABLE_CN=1 in the worker env.
+# -----------------------------
+if [[ "${FORCE_DISABLE_CN:-0}" == "1" ]]; then
+  echo "[patch] Hard-disabling Deforum ControlNet via env toggle (FORCE_DISABLE_CN=1)…"
+  python - <<'PY' || true
+import io, os, re
+p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/parseq_adapter.py"
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        s = f.read()
+    # Replace the CN decorator line with a hard None so CN is skipped completely.
+    pattern = r"self\.cn_keys\s*=\s*ParseqControlNetKeysDecorator\(self,\s*ControlNetKeys\(anim_args,\s*controlnet_args\)\)\s*if\s*controlnet_args\s*else\s*None"
+    s2 = re.sub(pattern, "self.cn_keys = None", s, flags=re.M)
+    if s2 != s:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(s2)
+        print("[patch] parseq_adapter.py patched: ControlNet forcibly disabled.")
+    else:
+        print("[patch] CN patch already applied or target pattern not found (ok).")
+except Exception as e:
+    print("[patch] CN patch failed:", e)
+PY
+fi
 
 # -----------------------------
 # Checkpoint & ControlNet model presence (clear, log-first)
