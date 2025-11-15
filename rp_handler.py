@@ -30,32 +30,96 @@ def newest_video(paths):
     return cand[0]
 
 def upload_to_vercel_blob(file_path: str, run_id: str):
-    base = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")
+    """
+    Uploads a file to Vercel Blob, trying the official PUT flow first, then
+    a POST multipart fallback if available.
+
+    Env it understands:
+      - VERCEL_BLOB_BASE (must be https://api.blob.vercel-storage.com)
+      - VERCEL_BLOB_RW_TOKEN / VERCEL_BLOB_READ_WRITE_TOKEN / VERCEL_BLOB_TOKEN
+      - VERCEL_BLOB_READ_WRITE_URL (legacy/alt POST endpoint; optional)
+    """
+    base = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE") or "https://api.blob.vercel-storage.com"
     token = (os.getenv("VERCEL_BLOB_RW_TOKEN")
              or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN")
              or os.getenv("VERCEL_BLOB_TOKEN"))
-    if not base or not token:
-        return {"ok": False, "reason": "missing_env"}
-    path = Path(file_path)
-    if not path.exists():
+    post_url = os.getenv("VERCEL_BLOB_READ_WRITE_URL")  # optional signed URL variant
+
+    # Normalize: we expect the API host for writes
+    base = base.rstrip("/")
+    if "vercel-storage.com" in base and not base.startswith("https://api.blob.vercel-storage.com"):
+        # You likely pointed at a public/read host; fix it automatically
+        base = "https://api.blob.vercel-storage.com"
+
+    p = Path(file_path)
+    if not p.exists():
         return {"ok": False, "reason": "file_missing"}
-    key = f"runs/{run_id}/{path.name}"
-    url = f"{base.rstrip('/')}/?pathname={requests.utils.quote(key, safe='')}"
-    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    with path.open("rb") as f:
-        r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype},
-                         data=f.read(), timeout=180)
-    if r.status_code not in (200, 201):
-        try:
-            body = r.json()
-        except Exception:
-            body = _tail(r.text, 400)
-        return {"ok": False, "reason": f"upload_http_{r.status_code}", "body": body}
+
+    if not token and not post_url:
+        return {"ok": False, "reason": "missing_env", "need": ["VERCEL_BLOB_RW_TOKEN or VERCEL_BLOB_READ_WRITE_URL"]}
+
+    # Reasonable, safe key (no spaces, no weird chars)
+    safe_name = p.name.replace(" ", "-")
+    key = f"runs/{run_id}/{safe_name}"
+    ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    body = p.read_bytes()
+
+    attempts = []
+
+    # --- Attempt A: PUT with pathname no leading slash
     try:
-        body = r.json()
-    except Exception:
-        body = {"url": r.text}
-    return {"ok": True, "url": body.get("url") or url, "key": key}
+        url = f"{base}?pathname={requests.utils.quote(key, safe='')}"
+        r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype}, data=body, timeout=180)
+        attempts.append({"method": "PUT", "url": url, "status": r.status_code, "text_tail": (r.text or "")[-200:]})
+        if r.status_code in (200, 201):
+            try:
+                jb = r.json()
+            except Exception:
+                jb = {"url": r.text}
+            return {"ok": True, "url": jb.get("url") or jb.get("downloadUrl") or jb.get("pathname") or url,
+                    "key": key, "attempts": attempts}
+    except Exception as e:
+        attempts.append({"method": "PUT", "error": str(e)})
+
+    # --- Attempt B: PUT with leading slash pathname
+    try:
+        url2 = f"{base}?pathname=%2F{requests.utils.quote(key, safe='')}"
+        r2 = requests.put(url2, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype}, data=body, timeout=180)
+        attempts.append({"method": "PUT", "url": url2, "status": r2.status_code, "text_tail": (r2.text or "")[-200:]})
+        if r2.status_code in (200, 201):
+            try:
+                jb = r2.json()
+            except Exception:
+                jb = {"url": r2.text}
+            return {"ok": True, "url": jb.get("url") or jb.get("downloadUrl") or jb.get("pathname") or url2,
+                    "key": key, "attempts": attempts}
+    except Exception as e:
+        attempts.append({"method": "PUT-leading-slash", "error": str(e)})
+
+    # --- Attempt C: POST multipart (if a signed RW URL is available)
+    if post_url:
+        try:
+            files = {
+                "file": (safe_name, body, ctype),
+            }
+            data = {"pathname": key}
+            r3 = requests.post(post_url, headers={"Authorization": f"Bearer {token}"} if token else {}, files=files, data=data, timeout=180)
+            attempts.append({"method": "POST-multipart", "url": post_url, "status": r3.status_code, "text_tail": (r3.text or "")[-200:]})
+            if r3.status_code in (200, 201):
+                try:
+                    jb = r3.json()
+                except Exception:
+                    jb = {"url": r3.text}
+                return {"ok": True, "url": jb.get("url") or jb.get("downloadUrl") or jb.get("pathname"), "key": key, "attempts": attempts}
+        except Exception as e:
+            attempts.append({"method": "POST-multipart", "error": str(e)})
+
+    # If we got here, all attempts failed
+    return {"ok": False, "reason": "all_attempts_failed", "attempts": attempts, "suggest": {
+        "ensure_base": "Set VERCEL_BLOB_BASE=https://api.blob.vercel-storage.com",
+        "ensure_token": "Use a Read-Write token (VERCEL_BLOB_RW_TOKEN)",
+        "pathname_rules": "Avoid spaces; try without and with leading slash",
+    }}
 
 # ---------- job builder ----------
 def build_deforum_job(inp: dict) -> dict:
