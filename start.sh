@@ -50,10 +50,22 @@ fi
 mkdir -p "$CN_EXT/models"
 
 # -----------------------------
-# Log available checkpoints (helps diagnose downloads vs baked models)
+# Checkpoint & ControlNet model presence (clear, log-first)
 # -----------------------------
-echo "[start] Listing baked SD models:"
+echo "[check] CKPT_PATH=${CKPT_PATH:-<unset>}"
+if [[ -n "${CKPT_PATH:-}" ]]; then
+  if [[ -f "$CKPT_PATH" ]]; then
+    echo "[check] ✅ Found checkpoint at CKPT_PATH"
+  else
+    echo "[check] ❌ CKPT_PATH points to a missing file"
+  fi
+fi
+
+echo "[check] Stable-diffusion models in $A1111_DIR/models/Stable-diffusion:"
 ls -lh "$A1111_DIR/models/Stable-diffusion" || true
+
+echo "[check] ControlNet models dir: $CN_EXT/models"
+ls -lh "$CN_EXT/models" || true
 
 # -----------------------------
 # Optional: copy deforum_api.py to /scripts if present
@@ -144,6 +156,14 @@ for i in range(360):  # up to ~6 minutes
 print("[start] WARNING: A1111 API on :3000 not ready after wait (continuing anyway).")
 sys.exit(0)
 PY
+
+# -----------------------------
+# Dump models via API (sanity: A1111 sees your ckpt)
+# -----------------------------
+echo "[debug] sd-models from API:"
+( curl -s http://127.0.0.1:3000/sdapi/v1/sd-models \
+  | jq -r 'try .[].title catch empty' \
+  | sed 's/^/[sd-models] /' ) || true
 
 # -----------------------------
 # Dump available routes (helps confirm any deforum endpoints)
