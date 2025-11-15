@@ -6,6 +6,8 @@ FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 ARG A1111_COMMIT=
 ARG DEFORUM_COMMIT=
 ARG CONTROLNET_COMMIT=
+# Animal OpenPose model URL (override if you mirror)
+ARG CN_ANIMAL_OPENPOSE_URL="https://huggingface.co/f5aiteam/Controlnet/resolve/main/control_sd15_animal_openpose_fp16.pth?download=true"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -54,6 +56,19 @@ RUN git clone --depth 1 https://github.com/deforum-art/sd-webui-deforum \
       cd /workspace/stable-diffusion-webui/extensions/sd-webui-controlnet && git fetch --depth 1 origin "$CONTROLNET_COMMIT" && git checkout "$CONTROLNET_COMMIT"; \
     fi && \
     mkdir -p /workspace/stable-diffusion-webui/extensions/sd-webui-controlnet/models
+
+# ---------- ControlNet Animal OpenPose (fp16) baked into image ----------
+# 🔴 Adds the required ControlNet model so CN "animal openpose" works out of the box.
+RUN set -eux; \
+    CN_DIR="/workspace/stable-diffusion-webui/extensions/sd-webui-controlnet/models"; \
+    CN_FILE="$CN_DIR/control_sd15_animal_openpose_fp16.pth"; \
+    if [ ! -f "$CN_FILE" ]; then \
+      echo "Downloading Animal OpenPose model to $CN_FILE"; \
+      curl -L --fail -o "$CN_FILE" "$CN_ANIMAL_OPENPOSE_URL"; \
+    else \
+      echo "Model already present: $CN_FILE"; \
+    fi; \
+    ls -lh "$CN_FILE"
 
 # ---------- Worker venv (rp_handler uses this) ----------
 RUN python3.10 -m venv /workspace/venv && \
