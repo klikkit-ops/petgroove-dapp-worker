@@ -158,32 +158,93 @@ PY
 
 # -----------------------------
 # Hotfix Deforum: guard against None schedule parsing
-# (coerce None -> '0:(0)' inside parse_inbetweens)
+# (coerce None/numeric -> '0:(0)' / '0:(num)' in BOTH parse_inbetweens and parse_key_frames)
 # -----------------------------
 python - <<'PY'
-import os, re
+import re, sys, os
+
 p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/animation_key_frames.py"
+
+def inject_after_func_header(src: str, func_name: str, guard_block: str, marker: str):
+    """
+    Find 'def func_name(...):' and inject guard_block as the very first statements.
+    Resilient to minor formatting differences. No-op if marker already present.
+    """
+    if marker in src:
+        return src, False
+
+    pat = re.compile(rf"(^\s*def\s+{func_name}\s*\([^\)]*\)\s*:\s*\n)", re.MULTILINE)
+    m = pat.search(src)
+    if not m:
+        return src, False
+
+    insert_at = m.end()
+    # Try to infer body indentation from the next non-empty line; default to 8 spaces
+    body_indent = "        "
+    after = src[insert_at:]
+    for ln in after.splitlines(True)[:5]:
+        if ln.strip():
+            sp = len(ln) - len(ln.lstrip(" "))
+            if sp > 0:
+                body_indent = " " * sp
+            break
+
+    guard_indented = "".join(body_indent + line if line.strip() else line
+                             for line in guard_block.splitlines(True))
+
+    new_src = src[:insert_at] + guard_indented + src[insert_at:]
+    return new_src, True
+
 try:
-    s = open(p, "r", encoding="utf-8").read()
-    if "HOTFIX_NONE_TO_SCHEDULE" not in s:
-        # Prefer regex so it survives minor formatting differences
-        s2 = re.sub(
-            r"def\s+parse_inbetweens\(\s*self\s*,\s*value\s*,\s*filename\s*=\s*None\s*,\s*is_single_string\s*=\s*False\s*\)\s*:",
-            "def parse_inbetweens(self, value, filename = None, is_single_string = False):\n"
-            "        # HOTFIX_NONE_TO_SCHEDULE: coerce None to neutral schedule to avoid 'NoneType.split'\n"
-            "        if value is None:\n"
-            "            value = '0:(0)'",
-            s, count=1
-        )
-        if s2 != s:
-            open(p, "w", encoding="utf-8").write(s2)
-            print("[hotfix] Patched Deforum parse_inbetweens: None -> '0:(0)'.")
-        else:
-            print("[hotfix] Target function signature not found; no changes made.")
-    else:
-        print("[hotfix] Patch already applied.")
+    with open(p, "r", encoding="utf-8") as f:
+        s = f.read()
 except Exception as e:
-    print("[hotfix] Patch failed:", e)
+    print("[hotfix] Failed to read file:", e)
+    sys.exit(0)
+
+# Guard for parse_inbetweens (value may be None or numeric)
+guard_inbetweens = """# HOTFIX_NONE_GUARD_PI
+try:
+    _val = locals().get("value", None)
+    if _val is None:
+        value = "0:(0)"
+    elif isinstance(_val, (int, float)):
+        value = f"0:({_val})"
+except Exception:
+    pass
+"""
+
+# Guard for parse_key_frames (param can be named 'string' or 'value')
+guard_keyframes = """# HOTFIX_NONE_GUARD_PKF
+try:
+    _s = locals().get("string", None)
+    if _s is None:
+        _s = locals().get("value", None)
+    if _s is None:
+        string = "0:(0)"
+    elif isinstance(_s, (int, float)):
+        string = f"0:({_s})"
+    else:
+        string = str(_s)
+except Exception:
+    string = "0:(0)"
+"""
+
+patched_any = False
+s2, did1 = inject_after_func_header(s, "parse_inbetweens", guard_inbetweens, "HOTFIX_NONE_GUARD_PI")
+patched_any |= did1
+s3, did2 = inject_after_func_header(s2, "parse_key_frames", guard_keyframes, "HOTFIX_NONE_GUARD_PKF")
+patched_any |= did2
+
+if patched_any:
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(s3)
+        print("[hotfix] Patched Deforum: None guards added to parse_inbetweens & parse_key_frames.")
+    except Exception as e:
+        print("[hotfix] Failed to write patched file:", e)
+else:
+    print("[hotfix] No changes made (patch already present or function headers not found).")
 PY
 
 # -----------------------------
