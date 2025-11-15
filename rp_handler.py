@@ -1,4 +1,5 @@
-# rp_handler.py — Deforum CLI runner (CN enabled via vid_path) + timing + Vercel Blob upload + CN debug + init_image & negatives
+# rp_handler.py — Deforum CLI runner (CN enabled via vid_path) + timing + Vercel Blob upload
+# + CN discovery/resolve + init_image(base64) + pose video localizer + debug
 import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
 import requests
@@ -29,6 +30,7 @@ def newest_video(paths):
     cand.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
     return cand[0]
 
+# 🔴 Upload the finished video to Vercel Blob (tries proxy first, then direct API).
 def upload_to_vercel_blob(file_path: str, run_id: str):
     attempts = []
     path = Path(file_path)
@@ -98,6 +100,25 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         },
     }
 
+# ---------- small fetch/encode helpers ----------
+# 🔴 Save a remote pose video to a local file so ControlNet can read it (HTTP URLs won’t work reliably).
+def _download(url: str, dst: str, timeout=180):
+    r = requests.get(url, stream=True, timeout=timeout)
+    r.raise_for_status()
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as f:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    return dst
+
+# 🔴 Fetch an init image (pet photo) and return base64 so Deforum locks identity.
+def _b64_from_url(url: str, timeout=60) -> str:
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    import base64
+    return base64.b64encode(r.content).decode("utf-8")
+
 # ---------- CN: discover & resolve ----------
 def _get_cn_lists():
     models, modules = set(), set()
@@ -158,15 +179,17 @@ def build_deforum_job(inp: dict) -> dict:
     max_frames = int(inp.get("max_frames", seconds * fps))
     seed = int(inp.get("seed", 42))
 
-    # init image (pet photo)
-    init_image = inp.get("init_image") or inp.get("image_url") or ""
+    # 🔴 Init image (identity lock): prefer prepared base64, else raw provided base64.
+    init_b64 = inp.get("_prepared_init_b64") or inp.get("init_image_b64")
+    init_image = init_b64 or inp.get("init_image") or ""  # keep legacy key if caller already passed b64
     use_init = bool(init_image)
-    image_strength = float(inp.get("image_strength", 0.60))
+    image_strength = float(inp.get("image_strength", 0.72))  # 0.68–0.8 tends to preserve identity
 
     # ControlNet
     cn = inp.get("controlnet") or {}
     cn_enabled = bool(cn.get("enabled", False))
-    cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
+    # 🔴 Pose video: prefer prepared local path, fall back to any caller-provided path.
+    cn_1_vid_path = inp.get("_prepared_pose_local") or cn.get("vid_path") or inp.get("pose_video_path") or ""
     resolved_model, resolved_module, _models, _modules = _resolve_cn(
         cn.get("model"), cn.get("module")
     )
@@ -215,16 +238,16 @@ def build_deforum_job(inp: dict) -> dict:
         "cfg_scale": float(inp.get("cfg_scale", 6.5)),
         "animation_mode": "2D",
 
-        # transforms
+        # transforms (keep camera still; CN drives motion)
         "angle": "0:(0)",
         "zoom": "0:(1.0)",
         "translation_x": "0:(0)",
         "translation_y": "0:(0)",
         "translation_z": "0:(0)",
 
-        # init (pet identity)
+        # 🔴 Init (pet identity)
         "use_init": use_init,
-        "init_image": init_image,
+        "init_image": init_image,  # base64 string
         "image_strength_schedule": S(inp.get("image_strength_schedule"), f"0:({image_strength})"),
         "strength_schedule": S(inp.get("strength_schedule"), f"0:({image_strength})"),
 
@@ -279,6 +302,34 @@ def handler(event):
     timings = []
     inp = (event or {}).get("input") or {}
 
+    # 🔴 Prepare local pose video and base64 init image from URLs (if provided).
+    pose_local = None
+    init_b64 = None
+    try:
+        pose_url = (
+            inp.get("pose_video_url")
+            or (inp.get("controlnet") or {}).get("vid_url")
+            or inp.get("cn_vid_url")
+        )
+        if pose_url:
+            # create a unique file so concurrent runs don't collide
+            pose_local = _download(pose_url, f"/workspace/inputs/{run_id}_pose.mp4")
+
+        init_url = (
+            inp.get("init_image_url")
+            or inp.get("image_url")
+        )
+        if init_url:
+            init_b64 = _b64_from_url(init_url)
+    except Exception as e:
+        # non-fatal; keep going even if fetch fails
+        pass
+
+    if init_b64:
+        inp["_prepared_init_b64"] = init_b64
+    if pose_local:
+        inp["_prepared_pose_local"] = pose_local
+
     t0 = time.time()
     job = build_deforum_job(inp)
     timings.append({"step": "build_job", "ms": int((time.time() - t0) * 1000)})
@@ -318,6 +369,11 @@ def handler(event):
         "total_elapsed_ms": int((time.time() - handler_start) * 1000),
         "debug_available_cn_models": models_list,
         "debug_available_cn_modules": modules_list,
+        # 🔴 Show what we actually consumed (helps debug).
+        "debug_inputs": {
+            "used_init_image": bool(init_b64 or inp.get("init_image_b64") or inp.get("init_image")),
+            "pose_video_local": pose_local,
+        },
     }
     if not ok:
         out["launch_tail"] = res.get("tail")
