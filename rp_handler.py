@@ -56,6 +56,7 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
     return {"ok": True, "url": body.get("url") or url, "key": key}
 
 # ---------- build a Deforum config that matches YOUR keys ----------
+
 def build_deforum_job(inp: dict) -> dict:
     S = _sched
 
@@ -70,7 +71,6 @@ def build_deforum_job(inp: dict) -> dict:
     cn_enabled = bool(cn.get("enabled", False))
     cn_vid     = cn.get("vid_path") or inp.get("pose_video_path") or ""
 
-    # Core Deforum params
     job = {
         "prompt": {"0": prompt},
         "seed": seed,
@@ -90,21 +90,18 @@ def build_deforum_job(inp: dict) -> dict:
         "use_init": False,
         "init_image": "",
         "video_init_path": "",
-        "use_parseq": False,                     # keep parseq off
+        "use_parseq": False,
         "make_video": True,
         "save_video": True,
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
     }
 
-    # ---- TOP-LEVEL ControlNet keys (your build expects these exact names) ----
-    # Provide EVERY key as a safe default so nothing is None during parsing.
-    job.update({
+    # ---- REQUIRED: nested controlnet_args namespace ----
+    cn_ns = {
         "cn_1_enabled": cn_enabled,
-        "cn_1_model": cn.get("model", "None"),                  # keep 'None' until a real model file exists
+        "cn_1_model": cn.get("model", "None"),           # keep "None" until the real model is present
         "cn_1_module": cn.get("module", "openpose_full"),
-
-        # schedules
         "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
         "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
         "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
@@ -112,13 +109,9 @@ def build_deforum_job(inp: dict) -> dict:
         "cn_1_processor_res": S(cn.get("processor_res"), "0:(512)"),
         "cn_1_threshold_a": S(cn.get("threshold_a"), "0:(64)"),
         "cn_1_threshold_b": S(cn.get("threshold_b"), "0:(64)"),
-
-        # boolean-ish flags as schedules (Deforum parses them as inbetweens)
         "cn_1_guess_mode": S(cn.get("guess_mode"), "0:(0)"),
         "cn_1_invert_image": S(cn.get("invert_image"), "0:(0)"),
         "cn_1_rgbbgr_mode": S(cn.get("rgbbgr_mode"), "0:(0)"),
-
-        # plain flags/strings
         "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
         "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
         "cn_1_control_mode": cn.get("control_mode", "Balanced"),
@@ -127,7 +120,11 @@ def build_deforum_job(inp: dict) -> dict:
         "cn_1_overwrite_frames": True,
         "cn_1_mask_vid_path": "",
         "cn_1_vid_path": cn_vid,
-    })
+    }
+    job["controlnet_args"] = cn_ns
+
+    # (Optional) keep a duplicate at top level too; harmless and sometimes helpful with older loaders:
+    job.update(cn_ns)
 
     return job
 
