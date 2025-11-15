@@ -63,7 +63,6 @@ p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/defor
 try:
     with open(p, "r", encoding="utf-8") as f:
         s = f.read()
-    # Replace the CN decorator line with a hard None so CN is skipped completely.
     pattern = r"self\.cn_keys\s*=\s*ParseqControlNetKeysDecorator\(self,\s*ControlNetKeys\(anim_args,\s*controlnet_args\)\)\s*if\s*controlnet_args\s*else\s*None"
     s2 = re.sub(pattern, "self.cn_keys = None", s, flags=re.M)
     if s2 != s:
@@ -155,6 +154,36 @@ except Exception:
     print("[start] installing clip into A1111 venv (safety net)…")
     import sys, subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/openai/CLIP.git#egg=clip"])
+PY
+
+# -----------------------------
+# Hotfix Deforum: guard against None schedule parsing
+# (coerce None -> '0:(0)' inside parse_inbetweens)
+# -----------------------------
+python - <<'PY'
+import os, re
+p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/animation_key_frames.py"
+try:
+    s = open(p, "r", encoding="utf-8").read()
+    if "HOTFIX_NONE_TO_SCHEDULE" not in s:
+        # Prefer regex so it survives minor formatting differences
+        s2 = re.sub(
+            r"def\s+parse_inbetweens\(\s*self\s*,\s*value\s*,\s*filename\s*=\s*None\s*,\s*is_single_string\s*=\s*False\s*\)\s*:",
+            "def parse_inbetweens(self, value, filename = None, is_single_string = False):\n"
+            "        # HOTFIX_NONE_TO_SCHEDULE: coerce None to neutral schedule to avoid 'NoneType.split'\n"
+            "        if value is None:\n"
+            "            value = '0:(0)'",
+            s, count=1
+        )
+        if s2 != s:
+            open(p, "w", encoding="utf-8").write(s2)
+            print("[hotfix] Patched Deforum parse_inbetweens: None -> '0:(0)'.")
+        else:
+            print("[hotfix] Target function signature not found; no changes made.")
+    else:
+        print("[hotfix] Patch already applied.")
+except Exception as e:
+    print("[hotfix] Patch failed:", e)
 PY
 
 # -----------------------------
