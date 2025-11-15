@@ -10,10 +10,17 @@ export COMMANDLINE_ARGS="${WEBUI_ARGS:-"--api --listen --xformers --enable-insec
 export LAUNCH_BROWSER=0
 export PYTHONUNBUFFERED=1
 
+# New: CN envs you can set from the console/UI
+# CN_MODEL_NAME     -> model stem, default: control_sd15_animal_openpose_fp16
+# CN_MODEL_URL      -> full https URL to download the model from your blob (optional)
+# CN_MODULE_NAME    -> preferred preprocessor module (optional)
 echo "[start] COMMANDLINE_ARGS=${COMMANDLINE_ARGS}"
 echo "[start] A1111_PORT(for CLI)=${A1111_PORT:-3001}"
 echo "[start] CKPT_PATH=${CKPT_PATH:-<unset>}"
 echo "[start] FORCE_DISABLE_CN=${FORCE_DISABLE_CN:-0}"
+echo "[start] CN_MODEL_NAME=${CN_MODEL_NAME:-control_sd15_animal_openpose_fp16}"
+echo "[start] CN_MODEL_URL=${CN_MODEL_URL:-<unset>}"
+echo "[start] CN_MODULE_NAME=${CN_MODULE_NAME:-<auto>}"
 
 # -----------------------------
 # Python venv for the worker
@@ -51,23 +58,46 @@ fi
 mkdir -p "$CN_EXT/models"
 
 # -----------------------------
+# Ensure the ControlNet model is present BEFORE starting A1111
+# Accepts .safetensors or .pth; also creates a convenience symlink for the other.
+# Set CN_MODEL_URL to auto-download from your blob.
+# -----------------------------
+CN_DIR="$CN_EXT/models"
+CN_MODEL_NAME="${CN_MODEL_NAME:-control_sd15_animal_openpose_fp16}"
+CN_ST="$CN_DIR/${CN_MODEL_NAME}.safetensors"
+CN_PTH="$CN_DIR/${CN_MODEL_NAME}.pth"
+
+if [[ ! -f "$CN_ST" && ! -f "$CN_PTH" ]]; then
+  if [[ -n "${CN_MODEL_URL:-}" ]]; then
+    echo "[fetch] Downloading ControlNet model -> $CN_ST"
+    curl -L --retry 5 --retry-all-errors -o "$CN_ST" "$CN_MODEL_URL" || echo "[fetch] Download failed (will continue; you can place the file manually)."
+  else
+    echo "[fetch] CN_MODEL_URL not set and model not found; skipping download."
+  fi
+fi
+
+# Pair symlinks so either extension path works
+if [[ -f "$CN_PTH" && ! -f "$CN_ST" ]]; then
+  ln -sf "$(basename "$CN_PTH")" "$CN_ST"
+fi
+if [[ -f "$CN_ST" && ! -f "$CN_PTH" ]]; then
+  ln -sf "$(basename "$CN_ST")" "$CN_PTH"
+fi
+
+# -----------------------------
 # *** Hard-disable ControlNet if requested ***
-# (prevents NoneType.split crashes inside Deforum's CN parser)
-# Toggle by setting FORCE_DISABLE_CN=1 in the worker env.
 # -----------------------------
 if [[ "${FORCE_DISABLE_CN:-0}" == "1" ]]; then
   echo "[patch] Hard-disabling Deforum ControlNet via env toggle (FORCE_DISABLE_CN=1)…"
   python - <<'PY' || true
-import io, os, re
+import re
 p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/parseq_adapter.py"
 try:
-    with open(p, "r", encoding="utf-8") as f:
-        s = f.read()
-    pattern = r"self\.cn_keys\s*=\s*ParseqControlNetKeysDecorator\(self,\s*ControlNetKeys\(anim_args,\s*controlnet_args\)\)\s*if\s*controlnet_args\s*else\s*None"
-    s2 = re.sub(pattern, "self.cn_keys = None", s, flags=re.M)
+    s = open(p, "r", encoding="utf-8").read()
+    s2 = re.sub(r"self\.cn_keys\s*=\s*ParseqControlNetKeysDecorator\(self,\s*ControlNetKeys\(anim_args,\s*controlnet_args\)\)\s*if\s*controlnet_args\s*else\s*None",
+                "self.cn_keys = None", s, flags=re.M)
     if s2 != s:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(s2)
+        open(p, "w", encoding="utf-8").write(s2)
         print("[patch] parseq_adapter.py patched: ControlNet forcibly disabled.")
     else:
         print("[patch] CN patch already applied or target pattern not found (ok).")
@@ -91,8 +121,8 @@ fi
 echo "[check] Stable-diffusion models in $A1111_DIR/models/Stable-diffusion:"
 ls -lh "$A1111_DIR/models/Stable-diffusion" || true
 
-echo "[check] ControlNet models dir: $CN_EXT/models"
-ls -lh "$CN_EXT/models" || true
+echo "[check] ControlNet models dir: $CN_DIR"
+ls -lh "$CN_DIR" || true
 
 # -----------------------------
 # Optional: copy deforum_api.py to /scripts if present
@@ -128,18 +158,10 @@ try:
     print("[deforum.inspect] animation_key_frames keys:", json.dumps(keys[:400], indent=2))
 except Exception:
     print("[deforum.inspect] animation_key_frames parse failed:", traceback.format_exc()[-800:])
-try:
-    args_mod = load(f"{root}/args.py")
-    names = [n for n in dir(args_mod)] if args_mod else []
-    names = [n for n in names if ("Args" in n or "ControlNet" in n)]
-    print("[deforum.inspect] args.py symbols:", json.dumps(names, indent=2))
-except Exception:
-    print("[deforum.inspect] args.py load failed")
 PY
 
 # -----------------------------
 # A1111 venv + CLIP safety net
-# (Primary installs in Dockerfile; this is a runtime guard.)
 # -----------------------------
 A1111_PY="$A1111_DIR/venv/bin/python"
 if [[ ! -x "$A1111_PY" ]]; then
@@ -158,93 +180,30 @@ PY
 
 # -----------------------------
 # Hotfix Deforum: guard against None schedule parsing
-# (coerce None/numeric -> '0:(0)' / '0:(num)' in BOTH parse_inbetweens and parse_key_frames)
 # -----------------------------
 python - <<'PY'
-import re, sys, os
-
+import re
 p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/animation_key_frames.py"
-
-def inject_after_func_header(src: str, func_name: str, guard_block: str, marker: str):
-    """
-    Find 'def func_name(...):' and inject guard_block as the very first statements.
-    Resilient to minor formatting differences. No-op if marker already present.
-    """
-    if marker in src:
-        return src, False
-
-    pat = re.compile(rf"(^\s*def\s+{func_name}\s*\([^\)]*\)\s*:\s*\n)", re.MULTILINE)
-    m = pat.search(src)
-    if not m:
-        return src, False
-
-    insert_at = m.end()
-    # Try to infer body indentation from the next non-empty line; default to 8 spaces
-    body_indent = "        "
-    after = src[insert_at:]
-    for ln in after.splitlines(True)[:5]:
-        if ln.strip():
-            sp = len(ln) - len(ln.lstrip(" "))
-            if sp > 0:
-                body_indent = " " * sp
-            break
-
-    guard_indented = "".join(body_indent + line if line.strip() else line
-                             for line in guard_block.splitlines(True))
-
-    new_src = src[:insert_at] + guard_indented + src[insert_at:]
-    return new_src, True
-
 try:
-    with open(p, "r", encoding="utf-8") as f:
-        s = f.read()
-except Exception as e:
-    print("[hotfix] Failed to read file:", e)
-    sys.exit(0)
-
-# Guard for parse_inbetweens (value may be None or numeric)
-guard_inbetweens = """# HOTFIX_NONE_GUARD_PI
-try:
-    _val = locals().get("value", None)
-    if _val is None:
-        value = "0:(0)"
-    elif isinstance(_val, (int, float)):
-        value = f"0:({_val})"
-except Exception:
-    pass
-"""
-
-# Guard for parse_key_frames (param can be named 'string' or 'value')
-guard_keyframes = """# HOTFIX_NONE_GUARD_PKF
-try:
-    _s = locals().get("string", None)
-    if _s is None:
-        _s = locals().get("value", None)
-    if _s is None:
-        string = "0:(0)"
-    elif isinstance(_s, (int, float)):
-        string = f"0:({_s})"
+    s = open(p, "r", encoding="utf-8").read()
+    if "HOTFIX_NONE_TO_SCHEDULE" not in s:
+        s2 = re.sub(
+            r"def\s+parse_inbetweens\(\s*self\s*,\s*value\s*,\s*filename\s*=\s*None\s*,\s*is_single_string\s*=\s*False\s*\)\s*:",
+            "def parse_inbetweens(self, value, filename = None, is_single_string = False):\n"
+            "        # HOTFIX_NONE_TO_SCHEDULE: coerce None to neutral schedule to avoid 'NoneType.split'\n"
+            "        if value is None:\n"
+            "            value = '0:(0)'",
+            s, count=1
+        )
+        if s2 != s:
+            open(p, "w", encoding="utf-8").write(s2)
+            print("[hotfix] Patched Deforum parse_inbetweens: None -> '0:(0)'.")
+        else:
+            print("[hotfix] Target function signature not found; no changes made.")
     else:
-        string = str(_s)
-except Exception:
-    string = "0:(0)"
-"""
-
-patched_any = False
-s2, did1 = inject_after_func_header(s, "parse_inbetweens", guard_inbetweens, "HOTFIX_NONE_GUARD_PI")
-patched_any |= did1
-s3, did2 = inject_after_func_header(s2, "parse_key_frames", guard_keyframes, "HOTFIX_NONE_GUARD_PKF")
-patched_any |= did2
-
-if patched_any:
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(s3)
-        print("[hotfix] Patched Deforum: None guards added to parse_inbetweens & parse_key_frames.")
-    except Exception as e:
-        print("[hotfix] Failed to write patched file:", e)
-else:
-    print("[hotfix] No changes made (patch already present or function headers not found).")
+        print("[hotfix] Patch already applied.")
+except Exception as e:
+    print("[hotfix] Patch failed:", e)
 PY
 
 # -----------------------------
@@ -262,7 +221,7 @@ popd >/dev/null
 python - <<'PY'
 import time, requests, sys
 url = "http://127.0.0.1:3000/sdapi/v1/sd-models"
-for i in range(360):  # up to ~6 minutes
+for i in range(360):
     try:
         r = requests.get(url, timeout=2)
         if r.status_code == 200:
@@ -276,23 +235,15 @@ sys.exit(0)
 PY
 
 # -----------------------------
-# Dump models via API (sanity: A1111 sees your ckpt)
+# Sanity: show CN model+module lists
 # -----------------------------
-echo "[debug] sd-models from API:"
-( curl -s http://127.0.0.1:3000/sdapi/v1/sd-models \
-  | jq -r 'try .[].title catch empty' \
-  | sed 's/^/[sd-models] /' ) || true
+echo "[debug] ControlNet model_list:"
+curl -s http://127.0.0.1:3000/controlnet/model_list || true; echo
+echo "[debug] ControlNet module_list:"
+curl -s http://127.0.0.1:3000/controlnet/module_list || true; echo
 
 # -----------------------------
-# Dump available routes (helps confirm any deforum endpoints)
-# -----------------------------
-echo "[debug] Dumping /openapi.json route keys…"
-( curl -s http://127.0.0.1:3000/openapi.json \
-  | jq -r 'try .paths | keys[] catch empty' \
-  | sed 's/^/[route] /' ) || echo "[debug] Could not fetch /openapi.json (jq/curl missing or server busy)."
-
-# -----------------------------
-# Start RunPod worker (BLOCKS). Use -u for unbuffered logs.
+# Start RunPod worker (BLOCKS)
 # -----------------------------
 echo "[start] Starting RunPod worker…"
 exec python -u /workspace/rp_handler.py
