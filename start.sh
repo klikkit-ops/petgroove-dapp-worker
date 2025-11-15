@@ -179,9 +179,6 @@ except Exception:
 PY
 
 # -----------------------------
-# Hotfix Deforum: guard against None in CN schedules + log the offending key
-# -----------------------------
-# -----------------------------
 # Recover Deforum file, then apply a minimal, safe hotfix
 # (prevents NoneType.split without touching function structure)
 # -----------------------------
