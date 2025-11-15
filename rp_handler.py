@@ -109,65 +109,60 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
 # ---------- Deforum job builder ----------
 def build_deforum_job(inp: dict) -> dict:
     """
-    Build a Deforum config using the key names THIS Deforum build expects.
-    We fully populate cn_1_* so Deforum's schedule parser never sees None.
+    Build a Deforum config using the key names your Deforum build expects.
+    All schedule-like fields are string schedules to avoid NoneType.split.
     """
-    def S(x, default_str):  # schedule -> "0:(…)" string
-        if x is None or x == "": return default_str
-        if isinstance(x, (int, float)): return f"0:({x})"
+    def S(x, default_str):
+        if x is None or x == "":
+            return default_str
+        if isinstance(x, (int, float)):
+            return f"0:({x})"
         s = str(x).strip()
         return s if (":" in s and "(" in s and ")" in s) else f"0:({s})"
 
-    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
-    max_frames = int(inp.get("max_frames", 12))
+    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing the robot, same cat across frames, natural balance, consistent anatomy")
+    max_frames = int(inp.get("max_frames", 16))
     W = int(inp.get("width", 512))
     H = int(inp.get("height", 512))
     seed = int(inp.get("seed", 42))
     fps  = int(inp.get("fps", 8))
 
-    # ---- ControlNet (enable via input.controlnet.enabled) ----
+    # ---- ControlNet (Deforum expects cn_1_* keys) ----
     cn = inp.get("controlnet") or {}
     cn_enabled = bool(cn.get("enabled", False))
-    cn_vid = cn.get("vid_path") or inp.get("pose_video_path") or ""
-    cn_model = cn.get("model", "control_sd15_animal_openpose_fp16")
-    cn_module = cn.get("module", "openpose")  # works with Animal OpenPose
+    cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
 
-    # NOTE: keys below mirror what your grep showed Deforum expecting.
     controlnet_args = {
-        # toggles / misc
+        # required toggles/ids
         "cn_1_enabled": cn_enabled,
-        "cn_1_low_vram": False,
-        "cn_1_pixel_perfect": True,
-        "cn_1_loopback_mode": False,
-        "cn_1_overwrite_frames": True,
-        "cn_1_invert_image": False,
-        "cn_1_rgbbgr_mode": False,   # keep normal RGB
-
-        # model + preprocessor
-        "cn_1_module": cn_module,    # e.g. "openpose"
-        "cn_1_model": cn_model,      # e.g. "control_sd15_animal_openpose_fp16"
-
-        # video / mask paths (strings; OK if blank)
-        "cn_1_vid_path": cn_vid,
-        "cn_1_mask_vid_path": "",
-
-        # scalar knobs (integers / enums)
-        "cn_1_processor_res": int(cn.get("processor_res", 512)),
-        "cn_1_threshold_a": int(cn.get("threshold_a", 64)),
-        "cn_1_threshold_b": int(cn.get("threshold_b", 64)),
-        "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
-        "cn_1_control_mode": cn.get("control_mode", "Balanced"),
+        "cn_1_model": cn.get("model", "control_sd15_animal_openpose_fp16"),
+        "cn_1_module": cn.get("module", "openpose"),
 
         # schedules (must be strings)
         "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
+        "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
         "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
         "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
+        "cn_1_processor_res": S(cn.get("processor_res"), "0:(512)"),
+        "cn_1_threshold_a": S(cn.get("threshold_a"), "0:(64)"),
+        "cn_1_threshold_b": S(cn.get("threshold_b"), "0:(64)"),
         "cn_1_guess_mode": S(cn.get("guess_mode"), "0:(0)"),
 
-        # some builds also look for a separate series string; keep it valid
-        "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
+        # enums / booleans (not schedules)
+        "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
+        "cn_1_control_mode": cn.get("control_mode", "Balanced"),
+        "cn_1_low_vram": bool(cn.get("low_vram", False)),
+        "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
+        "cn_1_loopback_mode": False,
+        "cn_1_overwrite_frames": True,
+        "cn_1_invert_image": False,
+        "cn_1_rgbbgr_mode": False,
+        "cn_1_mask_vid_path": ""
     }
+    if cn_1_vid_path:
+        controlnet_args["cn_1_vid_path"] = cn_1_vid_path
 
+    # ---- Core Deforum (lean & safe) ----
     job = {
         "prompt": {"0": prompt},
         "seed": seed,
@@ -187,12 +182,12 @@ def build_deforum_job(inp: dict) -> dict:
         "translation_y": "0:(0)",
         "translation_z": "0:(0)",
 
-        # init off for smoke tests
+        # init OFF for smoke tests
         "use_init": False,
         "init_image": "",
         "video_init_path": "",
 
-        # not using Parseq in our flow
+        # no parseq
         "use_parseq": False,
 
         # outputs
@@ -201,7 +196,7 @@ def build_deforum_job(inp: dict) -> dict:
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
 
-        # attach full CN block
+        # attach CN args
         "controlnet_args": controlnet_args,
     }
 
