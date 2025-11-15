@@ -97,68 +97,84 @@ def _cn_block(idx: int, enabled: bool, module: str, model: str, user: dict):
 
 def build_deforum_job(inp: dict) -> dict:
     """
-    Minimal, safe Deforum config:
-    - All ControlNet slots present (1..3), disabled by default, with COMPLETE cn_* keys.
-    - Schedules expressed as strings to avoid NoneType.split.
-    - No Parseq. No init image/video for smoke tests unless provided.
+    Build a Deforum config using the key names Deforum actually expects.
+    NOTE: We always send string schedules so nothing is None.
     """
+    def S(x, default_str):
+        # schedule helper: coerce to deforum-style string schedule
+        if x is None or x == "":
+            return default_str
+        if isinstance(x, (int, float)):
+            return f"0:({x})"
+        s = str(x).strip()
+        return s if (":" in s and "(" in s and ")" in s) else f"0:({s})"
+
     prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
     max_frames = int(inp.get("max_frames", 12))
     W = int(inp.get("width", 512))
     H = int(inp.get("height", 512))
     seed = int(inp.get("seed", 42))
-    fps = int(inp.get("fps", 8))
+    fps  = int(inp.get("fps", 8))
 
-    # optional video init path (smoke tests should leave empty)
-    video_init_path = str(inp.get("video_init_path") or inp.get("pose_video_path") or "")
+    # ---- ControlNet (Deforum expects cn_1_* keys) ----
+    # Keep disabled by default for smoke tests; you can flip with input.controlnet.enabled = true
+    cn = inp.get("controlnet") or {}
+    cn_enabled = bool(cn.get("enabled", False))
 
-    # Base image/video settings
+    # If you’re driving from a pose VIDEO, put its path (or URL Deforum can load) here:
+    # We pass through a cn_1_vid_path only if provided by caller.
+    cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
+
+    controlnet_args = {
+        "cn_1_enabled": cn_enabled,
+        "cn_1_model": cn.get("model", "control_sd15_animal_openpose_fp16"),
+        "cn_1_module": cn.get("module", "openpose"),   # 'openpose' works with Animal OpenPose
+        "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
+        "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
+        "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
+        "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
+        "cn_1_annotator_resolution": S(cn.get("annotator_resolution"), "0:(512)"),
+    }
+    if cn_1_vid_path:
+        controlnet_args["cn_1_vid_path"] = cn_1_vid_path  # only include if provided
+
+    # ---- Core Deforum params (lean & safe) ----
     job = {
         "prompt": {"0": prompt},
         "seed": seed,
         "max_frames": max_frames,
         "W": W,
         "H": H,
-        "sampler": "Euler a",
-        "steps": int(inp.get("steps", 25)),
-        "cfg_scale": float(inp.get("cfg_scale", 7)),
-        "animation_mode": "2D",
         "fps": fps,
+        "sampler": "Euler a",
+        "steps": 25,
+        "cfg_scale": 7,
+        "animation_mode": "2D",
 
-        # Common schedules as strings
+        # common transforms as schedules
         "angle": "0:(0)",
         "zoom": "0:(1.0)",
         "translation_x": "0:(0)",
         "translation_y": "0:(0)",
         "translation_z": "0:(0)",
 
-        # No Parseq
+        # init OFF for smoke tests
+        "use_init": False,
+        "init_image": "",
+        "video_init_path": "",
+
+        # not using Parseq
         "use_parseq": False,
 
-        # Init/video init
-        "use_init": bool(video_init_path),
-        "init_image": "",
-        "video_init_path": video_init_path,
-
-        # Output
+        # outputs
         "make_video": True,
         "save_video": True,
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
+
+        # attach controlnet args so Deforum parser sees cn_1_* keys
+        "controlnet_args": controlnet_args,
     }
-
-    # ControlNet: 3 slots, all keys present and schedules as strings
-    # Slot 1 defaults to animal openpose naming but stays disabled unless caller enables it.
-    want_cn = bool((inp.get("controlnet") or {}).get("enabled"))
-    cn_module = (inp.get("controlnet") or {}).get("module") or ("openpose_full" if want_cn else "none")
-    cn_model  = (inp.get("controlnet") or {}).get("model")  or ("control_sd15_animal_openpose_fp16" if want_cn else "None")
-
-    job.update(_cn_block(1, want_cn, cn_module, cn_model, inp))
-    job.update(_cn_block(2, False, "none", "None", {}))
-    job.update(_cn_block(3, False, "none", "None", {}))
-
-    # Some Deforum builds also read this flag:
-    job["controlnet_enabled"] = want_cn
 
     return job
 
