@@ -1,4 +1,4 @@
-# rp_handler.py — Deforum CLI runner (CN only when enabled) + timing + optional Vercel Blob upload
+# rp_handler.py — Deforum CLI runner (CN only when enabled) + timing + optional Vercel Blob upload + CN debug keys
 import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
 import requests
@@ -41,7 +41,7 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
 
     # Inputs
     api_base  = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE") or "https://api.blob.vercel-storage.com"
-    proxy_url = os.getenv("VERCEL_BLOB_PROXY_URL")  # e.g. https://petgroove.app/api/blob-upload
+    proxy_url = os.getenv("VERCEL_BLOB_PROXY_URL")  # e.g. https://your-app.vercel.app/api/blob-upload
     token     = (os.getenv("VERCEL_BLOB_RW_TOKEN")
                  or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN")
                  or os.getenv("VERCEL_BLOB_TOKEN"))
@@ -105,7 +105,7 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
             "proxy": "Set VERCEL_BLOB_PROXY_URL to a Vercel API route if DNS resolution keeps failing"
         },
     }
-    
+
 # ---------- Deforum job builder ----------
 def build_deforum_job(inp: dict) -> dict:
     """
@@ -233,6 +233,7 @@ def run_via_launch(job: dict, timings: list):
 
 # ---------- handler ----------
 def handler(event):
+    handler_start = time.time()
     run_id = uuid.uuid4().hex[:8]
     timings = []
     inp = (event or {}).get("input") or {}
@@ -271,9 +272,27 @@ def handler(event):
         "uploaded": uploaded,
         "env_seen": env_seen,
         "timings": timings,
+        "total_elapsed_ms": int((time.time() - handler_start) * 1000),
     }
     if not ok:
         out["launch_tail"] = res.get("tail")
+        # 🔎 Include CN keys/values to see exactly what we sent
+        cn = job.get("controlnet_args")
+        if cn:
+            out["debug_cn_keys"] = sorted(list(cn.keys()))
+            out["debug_cn_values"] = {
+                k: (cn[k] if isinstance(cn[k], (str, int, float, bool)) else str(cn[k]))
+                for k in out["debug_cn_keys"]
+            }
+    elif inp.get("debug"):
+        # Optional: include CN keys on success when input.debug=true
+        cn = job.get("controlnet_args")
+        if cn:
+            out["debug_cn_keys"] = sorted(list(cn.keys()))
+            out["debug_cn_values"] = {
+                k: (cn[k] if isinstance(cn[k], (str, int, float, bool)) else str(cn[k]))
+                for k in out["debug_cn_keys"]
+            }
 
     return {"status": "COMPLETED" if ok else "FAILED", "result": out}
 
