@@ -106,6 +106,59 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         },
     }
 
+# ---------- CN: discover & resolve ----------
+def _get_cn_lists():
+    """Return (models, modules) discovered from A1111 ControlNet endpoints."""
+    models, modules = set(), set()
+    # /controlnet/model_list
+    try:
+        j = requests.get(f"{A1111}/controlnet/model_list", timeout=5).json()
+        lst = j.get("model_list") if isinstance(j, dict) else j
+        if isinstance(lst, list):
+            models.update(lst)
+    except Exception:
+        pass
+    # /controlnet/module_list
+    try:
+        j = requests.get(f"{A1111}/controlnet/module_list", timeout=5).json()
+        lst = j.get("module_list") if isinstance(j, dict) else j
+        if isinstance(lst, list):
+            modules.update(lst)
+    except Exception:
+        pass
+    return sorted(models), sorted(modules)
+
+def _resolve_cn(model_in: "str | None", module_in: "str | None"):
+    """
+    Pick the best ControlNet model/module available.
+    Priority:
+      1) Env overrides CN_MODEL_NAME / CN_MODULE_NAME
+      2) Provided values
+      3) Sensible fallbacks present in the discovered lists
+    """
+    prefer_model = os.getenv("CN_MODEL_NAME") or model_in or "control_sd15_animal_openpose_fp16"
+    prefer_module = os.getenv("CN_MODULE_NAME") or module_in or "openpose_full"
+
+    avail_models, avail_modules = _get_cn_lists()
+
+    # Model resolution
+    model = prefer_model
+    if avail_models and model not in avail_models:
+        for cand in (prefer_model, "control_sd15_animal_openpose_fp16", "control_v11p_sd15_openpose"):
+            if cand in avail_models:
+                model = cand
+                break
+
+    # Module resolution
+    module = prefer_module
+    if avail_modules and module not in avail_modules:
+        for cand in (prefer_module, "animal_openpose", "openpose_full", "openpose"):
+            if cand in avail_modules:
+                module = cand
+                break
+
+    return model, module, avail_models, avail_modules
+
 # ---------- Deforum job builder ----------
 def build_deforum_job(inp: dict) -> dict:
     """
@@ -132,11 +185,16 @@ def build_deforum_job(inp: dict) -> dict:
     cn_enabled = bool(cn.get("enabled", False))
     cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
 
+    # Resolve model/module against what A1111 advertises (with env overrides)
+    resolved_model, resolved_module, _models, _modules = _resolve_cn(
+        cn.get("model"), cn.get("module")
+    )
+
     controlnet_args = {
         # required toggles/ids
         "cn_1_enabled": cn_enabled,
-        "cn_1_model": cn.get("model", "control_sd15_animal_openpose_fp16"),
-        "cn_1_module": cn.get("module", "openpose_full"),  # <-- was "openpose"
+        "cn_1_model": resolved_model,
+        "cn_1_module": resolved_module,  # auto-resolved
 
         # schedules (must be strings)
         "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
@@ -278,6 +336,11 @@ def handler(event):
         "timings": timings,
         "total_elapsed_ms": int((time.time() - handler_start) * 1000),
     }
+    # Expose what A1111 reported so we can see if names mismatched
+    models_list, modules_list = _get_cn_lists()
+    out["debug_available_cn_models"] = models_list
+    out["debug_available_cn_modules"] = modules_list
+
     if not ok:
         out["launch_tail"] = res.get("tail")
         # 🔎 Include CN keys/values to see exactly what we sent
