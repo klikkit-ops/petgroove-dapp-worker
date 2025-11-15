@@ -136,14 +136,18 @@ def build_deforum_job(inp: dict) -> dict:
         # required toggles/ids
         "cn_1_enabled": cn_enabled,
         "cn_1_model": cn.get("model", "control_sd15_animal_openpose_fp16"),
-        "cn_1_module": cn.get("module", "openpose"),
+        "cn_1_module": cn.get("module", "openpose_full"),  # <-- was "openpose"
 
         # schedules (must be strings)
         "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
         "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
         "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
         "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
+
+        # send BOTH, to satisfy either commit lineage
         "cn_1_processor_res": S(cn.get("processor_res"), "0:(512)"),
+        "cn_1_annotator_resolution": S(cn.get("annotator_resolution"), "0:(512)"),
+
         "cn_1_threshold_a": S(cn.get("threshold_a"), "0:(64)"),
         "cn_1_threshold_b": S(cn.get("threshold_b"), "0:(64)"),
         "cn_1_guess_mode": S(cn.get("guess_mode"), "0:(0)"),
