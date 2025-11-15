@@ -277,6 +277,9 @@ def run_via_launch(job: dict, timings: list):
     venv_py = "/workspace/stable-diffusion-webui/venv/bin/python"
     webui = "/workspace/stable-diffusion-webui"
 
+    # Use a different port for the CLI run to avoid colliding with the background A1111 in start.sh
+    cli_port = os.getenv("A1111_PORT", "3001")
+
     args = [
         venv_py, os.path.join(webui, "launch.py"),
         "--nowebui", "--skip-install",
@@ -284,7 +287,7 @@ def run_via_launch(job: dict, timings: list):
         "--deforum-terminate-after-run-now",
         "--api", "--listen", "--xformers",
         "--enable-insecure-extension-access",
-        "--port", "3000",
+        "--port", cli_port,
     ]
     env = os.environ.copy()
     proc = subprocess.run(args, cwd=webui, env=env,
