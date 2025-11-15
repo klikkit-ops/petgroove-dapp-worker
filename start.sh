@@ -135,7 +135,7 @@ else
 fi
 
 # -----------------------------
-# Deforum schema introspection (prints exact cn_* keys used by THIS build)
+# Deforum schema introspection (prints exact cn_* key names used by THIS build)
 # -----------------------------
 echo "[schema] Grepping Deforum for cn_* key names…"
 grep -RhoE "cn_[A-Za-z0-9_]+" "$DEF_EXT"/scripts | sort -u | sed 's/^/[deforum.cn] /' || true
@@ -179,29 +179,59 @@ except Exception:
 PY
 
 # -----------------------------
-# Hotfix Deforum: guard against None schedule parsing
+# Hotfix Deforum: guard against None in CN schedules + log the offending key
 # -----------------------------
 python - <<'PY'
-import re
+import io, os, re
+
 p = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts/deforum_helpers/animation_key_frames.py"
 try:
-    s = open(p, "r", encoding="utf-8").read()
-    if "HOTFIX_NONE_TO_SCHEDULE" not in s:
-        s2 = re.sub(
-            r"def\s+parse_inbetweens\(\s*self\s*,\s*value\s*,\s*filename\s*=\s*None\s*,\s*is_single_string\s*=\s*False\s*\)\s*:",
-            "def parse_inbetweens(self, value, filename = None, is_single_string = False):\n"
-            "        # HOTFIX_NONE_TO_SCHEDULE: coerce None to neutral schedule to avoid 'NoneType.split'\n"
-            "        if value is None:\n"
-            "            value = '0:(0)'",
-            s, count=1
-        )
-        if s2 != s:
-            open(p, "w", encoding="utf-8").write(s2)
-            print("[hotfix] Patched Deforum parse_inbetweens: None -> '0:(0)'.")
-        else:
-            print("[hotfix] Target function signature not found; no changes made.")
+    with open(p, "r", encoding="utf-8") as f:
+        s = f.read()
+    changed = False
+
+    # Patch parse_inbetweens(...) to coerce None and log which CN key (filename) was None
+    if "HOTFIX_NONE_PARSE_INBETWEENS" not in s:
+        m = re.search(r"(def\s+parse_inbetweens\([^\)]*\):\n)([ \t]+)", s)
+        if m:
+            indent = m.group(2)
+            inject = (
+                m.group(1)
+                + indent + "# HOTFIX_NONE_PARSE_INBETWEENS: default None to neutral schedule\n"
+                + indent + "if value is None:\n"
+                + indent + "    try:\n"
+                + indent + "        print(f\"[deforum-hotfix] parse_inbetweens: {filename} was None → '0:(0)'\", flush=True)\n"
+                + indent + "    except Exception:\n"
+                + indent + "        pass\n"
+                + indent + "    value = '0:(0)'\n"
+            )
+            s = s[:m.start()] + inject + s[m.end():]
+            changed = True
+
+    # Patch parse_key_frames(...) to coerce None and log
+    if "HOTFIX_NONE_PARSE_KEY_FRAMES" not in s:
+        m2 = re.search(r"(def\s+parse_key_frames\([^\)]*\):\n)([ \t]+)", s)
+        if m2:
+            indent2 = m2.group(2)
+            inject2 = (
+                m2.group(1)
+                + indent2 + "# HOTFIX_NONE_PARSE_KEY_FRAMES: default None\n"
+                + indent2 + "if string is None:\n"
+                + indent2 + "    try:\n"
+                + indent2 + "        print(\"[deforum-hotfix] parse_key_frames: received None → '0:(0)'\", flush=True)\n"
+                + indent2 + "    except Exception:\n"
+                + indent2 + "        pass\n"
+                + indent2 + "    string = '0:(0)'\n"
+            )
+            s = s[:m2.start()] + inject2 + s[m2.end():]
+            changed = True
+
+    if changed:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(s)
+        print("[hotfix] Deforum CN scheduler patched for None handling.")
     else:
-        print("[hotfix] Patch already applied.")
+        print("[hotfix] Deforum CN scheduler already patched or signatures not found (ok).")
 except Exception as e:
     print("[hotfix] Patch failed:", e)
 PY
