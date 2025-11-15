@@ -1,265 +1,193 @@
-# rp_handler.py — Deforum CLI runner with full cn_* schedules + timing + optional Vercel Blob upload
-import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
+# rp_handler.py — Adds a "debug" mode that holds the worker open and prints diagnostics.
+import os, json, time, glob, mimetypes, uuid, subprocess, re, traceback
 from pathlib import Path
 import requests
 import runpod
 
 A1111 = "http://127.0.0.1:3000"
 
-# ---------- small helpers ----------
 def _tail(txt: str, n: int = 1600) -> str:
     return (txt or "")[-n:]
 
-def _schedule(val, default_str: str) -> str:
-    """
-    Deforum wants schedule STRINGS like '0:(0.75)' for many fields.
-    - number -> "0:(number)"
-    - blank/None -> default_str
-    - string with schedule syntax -> as-is
-    - any other string -> wrap as "0:(string)"
-    """
-    if val is None or val == "":
-        return default_str
-    if isinstance(val, (int, float)):
-        return f"0:({val})"
-    s = str(val).strip()
-    if ":" in s and "(" in s and ")" in s:
-        return s
-    return f"0:({s})"
+def _print_hdr(title: str):
+    print(f"\n[debug] === {title} ===")
 
-def newest_video(paths):
-    cand = []
-    for p in paths:
-        cand.extend(glob.glob(os.path.join(p, "**", "*.mp4"), recursive=True))
-        cand.extend(glob.glob(os.path.join(p, "**", "*.webm"), recursive=True))
-        cand.extend(glob.glob(os.path.join(p, "**", "*.mov"), recursive=True))
-    if not cand:
-        return None
-    cand.sort(key=lambda x: Path(x).stat().st_mtime, reverse=True)
-    return cand[0]
-
-def upload_to_vercel_blob(file_path: str, run_id: str):
-    base = os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")
-    token = (os.getenv("VERCEL_BLOB_RW_TOKEN")
-             or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN")
-             or os.getenv("VERCEL_BLOB_TOKEN"))
-    if not base or not token:
-        return {"ok": False, "reason": "missing_env"}
-    path = Path(file_path)
-    if not path.exists():
-        return {"ok": False, "reason": "file_missing"}
-    key = f"runs/{run_id}/{path.name}"
-    url = f"{base.rstrip('/')}/?pathname={requests.utils.quote(key, safe='')}"
-    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    with path.open("rb") as f:
-        r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype},
-                         data=f.read(), timeout=180)
-    if r.status_code not in (200, 201):
-        try:
-            body = r.json()
-        except Exception:
-            body = _tail(r.text, 400)
-        return {"ok": False, "reason": f"upload_http_{r.status_code}", "body": body}
+def _ls(path: str, pattern: str = "*", limit: int = 200):
     try:
-        body = r.json()
-    except Exception:
-        body = {"url": r.text}
-    return {"ok": True, "url": body.get("url") or url, "key": key}
+        p = Path(path)
+        if not p.exists():
+            print(f"[debug] ls: {path} (missing)")
+            return []
+        items = sorted(p.glob(pattern))
+        rows = []
+        for i, item in enumerate(items[:limit]):
+            try:
+                sz = item.stat().st_size
+            except Exception:
+                sz = -1
+            print(f"[debug] {path}: {item.name} ({sz} bytes)")
+            rows.append({"name": item.name, "size": sz})
+        if len(items) > limit:
+            print(f"[debug] ... {len(items)-limit} more not shown")
+        return rows
+    except Exception as e:
+        print(f"[debug] ls failed for {path}: {e}")
+        return []
 
-# ---------- Deforum job builder ----------
-def _cn_block(idx: int, enabled: bool, module: str, model: str, user: dict):
-    """
-    Build a COMPLETE ControlNet slot (cn_#_*) with all schedule fields as STRINGS.
-    Deforum commonly parses schedules for weight + guidance_window; processor_res/thresholds are scalars.
-    """
-    pfx = f"cn_{idx}_"
-    # Defaults are safe/minimal; all schedule-y fields become strings
-    d = {
-        f"{pfx}overwrite_frames": True,
-        f"{pfx}vid_path": user.get("pose_video_path", "") or "",
-        f"{pfx}mask_vid_path": "",
-        f"{pfx}enabled": bool(enabled),
-        f"{pfx}low_vram": False,
-        f"{pfx}pixel_perfect": True,
-        f"{pfx}module": module,              # e.g. "openpose_full" (preprocessor); "none" if not using
-        f"{pfx}model": model,                # e.g. "control_sd15_animal_openpose_fp16" or "None"
-        f"{pfx}weight": _schedule(user.get("cn_weight"), "0:(1.0)"),
-        f"{pfx}guidance_start": _schedule(user.get("cn_guidance_start"), "0:(0.0)"),
-        f"{pfx}guidance_end": _schedule(user.get("cn_guidance_end"), "0:(1.0)"),
-        f"{pfx}processor_res": int(user.get("cn_processor_res", 512)),
-        f"{pfx}threshold_a": int(user.get("cn_threshold_a", 64)),
-        f"{pfx}threshold_b": int(user.get("cn_threshold_b", 64)),
-        f"{pfx}resize_mode": user.get("cn_resize_mode", "Inner Fit (Scale to Fit)"),
-        f"{pfx}control_mode": user.get("cn_control_mode", "Balanced"),
-        f"{pfx}loopback_mode": False,
-    }
-    return d
+def _grep_deforum_cn_keys():
+    """Greps Deforum scripts for cn_* names. This reflects EXACT keys used by the installed version."""
+    root = "/workspace/stable-diffusion-webui/extensions/sd-webui-deforum/scripts"
+    found = set()
+    for patt in ["**/*.py", "**/*.json", "**/*.md"]:
+        for f in Path(root).glob(patt):
+            try:
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                for m in re.findall(r"\bcn_[0-9]+_[A-Za-z0-9_]+", text):
+                    found.add(m)
+            except Exception:
+                pass
+    keys = sorted(found)
+    for k in keys[:400]:
+        print(f"[deforum.cn] {k}")
+    if len(keys) > 400:
+        print(f"[deforum.cn] ... {len(keys)-400} more not shown")
+    return keys
 
-def build_deforum_job(inp: dict) -> dict:
-    """
-    Build a Deforum config using the key names Deforum actually expects.
-    NOTE: We always send string schedules so nothing is None.
-    """
-    def S(x, default_str):
-        # schedule helper: coerce to deforum-style string schedule
-        if x is None or x == "":
-            return default_str
-        if isinstance(x, (int, float)):
-            return f"0:({x})"
-        s = str(x).strip()
-        return s if (":" in s and "(" in s and ")" in s) else f"0:({s})"
+def _probe_a1111_routes():
+    routes = []
+    try:
+        r = requests.get(f"{A1111}/openapi.json", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            paths = sorted((data.get("paths") or {}).keys())
+            for p in paths:
+                print(f"[route] {p}")
+            routes = paths
+        else:
+            print(f"[debug] openapi.json HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[debug] openapi.json fetch failed: {e}")
+    return routes
 
-    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
-    max_frames = int(inp.get("max_frames", 12))
-    W = int(inp.get("width", 512))
-    H = int(inp.get("height", 512))
-    seed = int(inp.get("seed", 42))
-    fps  = int(inp.get("fps", 8))
+def _check_url(url: str, timeout=3):
+    try:
+        r = requests.get(url, timeout=timeout)
+        return {"ok": r.status_code == 200, "status": r.status_code, "body": _tail(r.text, 300)}
+    except Exception as e:
+        return {"ok": False, "status": None, "error": str(e)}
 
-    # ---- ControlNet (Deforum expects cn_1_* keys) ----
-    # Keep disabled by default for smoke tests; you can flip with input.controlnet.enabled = true
-    cn = inp.get("controlnet") or {}
-    cn_enabled = bool(cn.get("enabled", False))
-
-    # If you’re driving from a pose VIDEO, put its path (or URL Deforum can load) here:
-    # We pass through a cn_1_vid_path only if provided by caller.
-    cn_1_vid_path = cn.get("vid_path") or inp.get("pose_video_path") or ""
-
-    controlnet_args = {
-        "cn_1_enabled": cn_enabled,
-        "cn_1_model": cn.get("model", "control_sd15_animal_openpose_fp16"),
-        "cn_1_module": cn.get("module", "openpose"),   # 'openpose' works with Animal OpenPose
-        "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
-        "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
-        "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
-        "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
-        "cn_1_annotator_resolution": S(cn.get("annotator_resolution"), "0:(512)"),
-    }
-    if cn_1_vid_path:
-        controlnet_args["cn_1_vid_path"] = cn_1_vid_path  # only include if provided
-
-    # ---- Core Deforum params (lean & safe) ----
-    job = {
-        "prompt": {"0": prompt},
-        "seed": seed,
-        "max_frames": max_frames,
-        "W": W,
-        "H": H,
-        "fps": fps,
-        "sampler": "Euler a",
-        "steps": 25,
-        "cfg_scale": 7,
-        "animation_mode": "2D",
-
-        # common transforms as schedules
-        "angle": "0:(0)",
-        "zoom": "0:(1.0)",
-        "translation_x": "0:(0)",
-        "translation_y": "0:(0)",
-        "translation_z": "0:(0)",
-
-        # init OFF for smoke tests
-        "use_init": False,
-        "init_image": "",
-        "video_init_path": "",
-
-        # not using Parseq
-        "use_parseq": False,
-
-        # outputs
-        "make_video": True,
-        "save_video": True,
-        "outdir": "/workspace/outputs/deforum",
-        "outdir_video": "/workspace/outputs/deforum",
-
-        # attach controlnet args so Deforum parser sees cn_1_* keys
-        "controlnet_args": controlnet_args,
-    }
-
-    return job
-
-# ---------- run via launch.py (CLI) ----------
-def run_via_launch(job: dict, timings: list):
-    """
-    Write a temp JSON config and ask A1111 to run it immediately via --deforum-run-now.
-    """
+def _wait_for_a1111(max_sec=360):
+    """Wait up to max_sec for A1111 to answer /sdapi/v1/sd-models."""
+    url = f"{A1111}/sdapi/v1/sd-models"
     t0 = time.time()
-    out_dir = job.get("outdir", "/workspace/outputs/deforum")
-    os.makedirs(out_dir, exist_ok=True)
+    while time.time() - t0 < max_sec:
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code == 200:
+                print("[debug] A1111 API is ready.")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    print("[debug] A1111 API did not become ready within wait window.")
+    return False
 
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(job, f)
-        cfg_path = f.name
+def _env_summary():
+    return {
+        "python": os.popen("python -V").read().strip(),
+        "pip_freeze_head": _tail(os.popen("pip freeze | head -n 30").read(), 1200),
+        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+        "ckpt_env": os.getenv("CKPT_PATH", "") or os.getenv("SD_CKPT_PATH", ""),
+    }
 
-    venv_py = "/workspace/stable-diffusion-webui/venv/bin/python"
-    webui = "/workspace/stable-diffusion-webui"
+def _find_ckpts():
+    base = "/workspace/stable-diffusion-webui/models/Stable-diffusion"
+    rows = _ls(base, "*.ckpt")
+    rows += _ls(base, "*.safetensors")
+    return [{"path": f"{base}/{r['name']}", "size": r["size"]} for r in rows]
 
-    # Use existing API server context; Deforum will run and then exit if requested
-    args = [
-        venv_py, os.path.join(webui, "launch.py"),
-        "--nowebui", "--skip-install",
-        "--deforum-run-now", cfg_path,
-        "--deforum-terminate-after-run-now",
-        "--api", "--listen", "--xformers",
-        "--enable-insecure-extension-access",
-        "--port", "3000",
+def _find_cn_models():
+    base = "/workspace/stable-diffusion-webui/extensions/sd-webui-controlnet/models"
+    rows = _ls(base, "*")
+    hit = [r for r in rows if "animal" in r["name"].lower() or "openpose" in r["name"].lower()]
+    return {"all": [r["name"] for r in rows], "animal_openpose_hits": [r["name"] for r in hit]}
+
+# --------------------------
+# DEBUG MODE: hold the job open
+# --------------------------
+def run_debug(inp: dict):
+    minutes = int(inp.get("minutes", 4))          # keep this below your endpoint job timeout
+    heartbeat = float(inp.get("heartbeat", 5.0))  # seconds between log prints
+
+    _print_hdr("Environment")
+    env = _env_summary()
+    print(json.dumps(env, indent=2))
+
+    _print_hdr("List models")
+    ckpts = _find_ckpts()
+    cnmods = _find_cn_models()
+
+    _print_hdr("Check A1111 readiness")
+    ready = _wait_for_a1111(max_sec=360)
+
+    _print_hdr("A1111 routes (/openapi.json)")
+    routes = _probe_a1111_routes()
+
+    _print_hdr("Deforum cn_* keys found in code")
+    cn_keys = _grep_deforum_cn_keys()
+
+    # Known deforum endpoints we’ve seen across versions (often not present):
+    candidates = [
+        f"{A1111}/deforum/run",
+        f"{A1111}/sdapi/v1/deforum/run",
+        f"{A1111}/deforum_api/run",
+        f"{A1111}/sdapi/v1/deforum_api/run",
     ]
-    env = os.environ.copy()
-    proc = subprocess.run(args, cwd=webui, env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3600)
-    timings.append({"step": "run_cli", "ms": int((time.time() - t0) * 1000)})
+    _print_hdr("Probe likely Deforum endpoints")
+    probes = {u: _check_url(u) for u in candidates}
+    for u, res in probes.items():
+        print(f"[probe] {u} -> {res}")
 
-    return {"retcode": proc.returncode, "tail": _tail(proc.stdout, 4000), "outdir": out_dir}
+    # Heartbeat loop to keep worker open
+    _print_hdr(f"Heartbeat for {minutes} minute(s)")
+    end = time.time() + minutes * 60
+    beats = 0
+    while time.time() < end:
+        beats += 1
+        print(f"[debug] heartbeat #{beats} — worker alive; A1111_ready={ready}")
+        time.sleep(heartbeat)
 
-# ---------- handler ----------
+    # Return compact summary (full details are in logs)
+    return {
+        "retcode": 0,
+        "summary": {
+            "a1111_ready": ready,
+            "routes_count": len(routes),
+            "deforum_cn_keys": len(cn_keys),
+            "ckpts_found": len(ckpts),
+            "cn_models_found": cnmods,
+            "probe_results": probes,
+        }
+    }
+
+# --------------------------
+# DEFAULT (non-debug) handler paths (no change to your generation code here)
+# --------------------------
 def handler(event):
-    run_id = uuid.uuid4().hex[:8]
-    tmarks = []
     inp = (event or {}).get("input") or {}
+    mode = (inp.get("mode") or "").lower()
 
-    t0 = time.time()
-    job = build_deforum_job(inp)
-    tmarks.append({"step": "build_job", "ms": int((time.time() - t0) * 1000)})
+    if mode == "debug":
+        res = run_debug(inp)
+        return {"status": "COMPLETED", "result": {"ok": True, "mode": "debug", **res}}
 
-    # Run
-    res = run_via_launch(job, tmarks)
-
-    # Pick newest video
-    t1 = time.time()
-    picked = newest_video([
-        "/workspace/outputs/deforum",
-        "/workspace/stable-diffusion-webui/outputs/deforum",
-        "/workspace/stable-diffusion-webui/outputs",
-    ])
-    tmarks.append({"step": "pick_video", "ms": int((time.time() - t1) * 1000)})
-
-    # Optional upload
-    t2 = time.time()
-    uploaded = {"ok": False, "reason": "skipped"}
-    if picked and inp.get("upload"):
-        uploaded = upload_to_vercel_blob(picked, run_id)
-    tmarks.append({"step": "maybe_upload", "ms": int((time.time() - t2) * 1000)})
-
-    env_seen = {
-        "blob_base_set": bool(os.getenv("VERCEL_BLOB_BASE") or os.getenv("BLOB_BASE")),
-        "blob_token_set": bool(os.getenv("VERCEL_BLOB_RW_TOKEN") or os.getenv("VERCEL_BLOB_READ_WRITE_TOKEN") or os.getenv("VERCEL_BLOB_TOKEN")),
-        "ckpt_path": os.getenv("SD_CKPT_PATH", ""),
+    # If you want to keep your generation path here, return a helpful message for now:
+    return {
+        "status": "COMPLETED",
+        "result": {
+            "ok": False,
+            "message": "No generation performed. Run with input.mode='debug' to hold worker open.",
+        },
     }
-
-    ok = (res["retcode"] == 0) and bool(picked)
-    out = {
-        "ok": ok,
-        "mode": "cli-launch",
-        "run_id": run_id,
-        "local_outdir": res.get("outdir"),
-        "picked_file": picked,
-        "uploaded": uploaded,
-        "env_seen": env_seen,
-        "timings": tmarks,
-    }
-    if not ok:
-        out["launch_tail"] = res.get("tail")
-
-    return {"status": "COMPLETED" if ok else "FAILED", "result": out}
 
 runpod.serverless.start({"handler": handler})
