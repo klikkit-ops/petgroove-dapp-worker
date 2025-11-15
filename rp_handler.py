@@ -1,4 +1,4 @@
-# rp_handler.py — Deforum CLI runner with full cn_* schedules + timing + optional Vercel Blob upload
+# rp_handler.py — Deforum CLI runner with full top-level cn_1_* schedules + timing
 import os, json, glob, time, tempfile, subprocess, mimetypes, uuid
 from pathlib import Path
 import requests
@@ -44,9 +44,10 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         r = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": ctype},
                          data=f.read(), timeout=180)
     if r.status_code not in (200, 201):
-        body = _tail(r.text, 400)
-        try: body = r.json()
-        except Exception: pass
+        try:
+            body = r.json()
+        except Exception:
+            body = _tail(r.text, 400)
         return {"ok": False, "reason": f"upload_http_{r.status_code}", "body": body}
     try:
         body = r.json()
@@ -54,50 +55,22 @@ def upload_to_vercel_blob(file_path: str, run_id: str):
         body = {"url": r.text}
     return {"ok": True, "url": body.get("url") or url, "key": key}
 
-# ---------- build a Deforum config that matches your keys ----------
+# ---------- build a Deforum config that matches YOUR keys ----------
 def build_deforum_job(inp: dict) -> dict:
-    prompt = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
+    S = _sched
+
+    prompt     = inp.get("prompt", "a photorealistic orange tabby cat doing a simple dance, studio lighting")
     max_frames = int(inp.get("max_frames", 12))
-    W = int(inp.get("width", 512))
-    H = int(inp.get("height", 512))
-    seed = int(inp.get("seed", 42))
-    fps  = int(inp.get("fps", 8))
+    W          = int(inp.get("width", 512))
+    H          = int(inp.get("height", 512))
+    seed       = int(inp.get("seed", 42))
+    fps        = int(inp.get("fps", 8))
 
-    cn = inp.get("controlnet") or {}
+    cn         = inp.get("controlnet") or {}
     cn_enabled = bool(cn.get("enabled", False))
-    cn_vid = cn.get("vid_path") or inp.get("pose_video_path") or ""
+    cn_vid     = cn.get("vid_path") or inp.get("pose_video_path") or ""
 
-    # Use the EXACT names your Deforum exposes (from your grep output)
-    controlnet_args = {
-        "cn_1_enabled": cn_enabled,
-        "cn_1_model": cn.get("model", "None"),            # keep 'None' until a model file is installed
-        "cn_1_module": cn.get("module", "openpose_full"),
-        "cn_1_weight": _sched(cn.get("weight"), "0:(1.0)"),
-        "cn_1_guidance_start": _sched(cn.get("guidance_start"), "0:(0.0)"),
-        "cn_1_guidance_end": _sched(cn.get("guidance_end"), "0:(1.0)"),
-
-        # These are parsed as schedules by Deforum in your build — send strings (not ints)
-        "cn_1_processor_res": _sched(cn.get("processor_res"), "0:(512)"),
-        "cn_1_threshold_a": _sched(cn.get("threshold_a"), "0:(64)"),
-        "cn_1_threshold_b": _sched(cn.get("threshold_b"), "0:(64)"),
-
-        # Booleans that Deforum sometimes treats like schedules — keep as schedule strings '0:(0/1)'
-        "cn_1_guess_mode": _sched(cn.get("guess_mode"), "0:(0)"),
-        "cn_1_invert_image": _sched(cn.get("invert_image"), "0:(0)"),
-        "cn_1_rgbbgr_mode": _sched(cn.get("rgbbgr_mode"), "0:(0)"),
-
-        # Non-schedule toggles / strings
-        "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
-        "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
-        "cn_1_control_mode": cn.get("control_mode", "Balanced"),
-        "cn_1_low_vram": bool(cn.get("low_vram", False)),
-        "cn_1_loopback_mode": bool(cn.get("loopback_mode", False)),
-        "cn_1_overwrite_frames": True,
-        "cn_1_mask_vid_path": "",
-    }
-    if cn_vid:
-        controlnet_args["cn_1_vid_path"] = cn_vid
-
+    # Core Deforum params
     job = {
         "prompt": {"0": prompt},
         "seed": seed,
@@ -109,15 +82,53 @@ def build_deforum_job(inp: dict) -> dict:
         "steps": 25,
         "cfg_scale": 7,
         "animation_mode": "2D",
-        "angle": "0:(0)", "zoom": "0:(1.0)",
-        "translation_x": "0:(0)", "translation_y": "0:(0)", "translation_z": "0:(0)",
-        "use_init": False, "init_image": "", "video_init_path": "",
-        "use_parseq": False,
-        "make_video": True, "save_video": True,
+        "angle": "0:(0)",
+        "zoom": "0:(1.0)",
+        "translation_x": "0:(0)",
+        "translation_y": "0:(0)",
+        "translation_z": "0:(0)",
+        "use_init": False,
+        "init_image": "",
+        "video_init_path": "",
+        "use_parseq": False,                     # keep parseq off
+        "make_video": True,
+        "save_video": True,
         "outdir": "/workspace/outputs/deforum",
         "outdir_video": "/workspace/outputs/deforum",
-        "controlnet_args": controlnet_args,
     }
+
+    # ---- TOP-LEVEL ControlNet keys (your build expects these exact names) ----
+    # Provide EVERY key as a safe default so nothing is None during parsing.
+    job.update({
+        "cn_1_enabled": cn_enabled,
+        "cn_1_model": cn.get("model", "None"),                  # keep 'None' until a real model file exists
+        "cn_1_module": cn.get("module", "openpose_full"),
+
+        # schedules
+        "cn_1_weight": S(cn.get("weight"), "0:(1.0)"),
+        "cn_1_weight_schedule_series": S(cn.get("weight_schedule_series"), "0:(1.0)"),
+        "cn_1_guidance_start": S(cn.get("guidance_start"), "0:(0.0)"),
+        "cn_1_guidance_end": S(cn.get("guidance_end"), "0:(1.0)"),
+        "cn_1_processor_res": S(cn.get("processor_res"), "0:(512)"),
+        "cn_1_threshold_a": S(cn.get("threshold_a"), "0:(64)"),
+        "cn_1_threshold_b": S(cn.get("threshold_b"), "0:(64)"),
+
+        # boolean-ish flags as schedules (Deforum parses them as inbetweens)
+        "cn_1_guess_mode": S(cn.get("guess_mode"), "0:(0)"),
+        "cn_1_invert_image": S(cn.get("invert_image"), "0:(0)"),
+        "cn_1_rgbbgr_mode": S(cn.get("rgbbgr_mode"), "0:(0)"),
+
+        # plain flags/strings
+        "cn_1_pixel_perfect": bool(cn.get("pixel_perfect", True)),
+        "cn_1_resize_mode": cn.get("resize_mode", "Inner Fit (Scale to Fit)"),
+        "cn_1_control_mode": cn.get("control_mode", "Balanced"),
+        "cn_1_low_vram": bool(cn.get("low_vram", False)),
+        "cn_1_loopback_mode": bool(cn.get("loopback_mode", False)),
+        "cn_1_overwrite_frames": True,
+        "cn_1_mask_vid_path": "",
+        "cn_1_vid_path": cn_vid,
+    })
+
     return job
 
 # ---------- run Deforum through launch.py ----------
@@ -131,7 +142,7 @@ def run_via_launch(job: dict, timings: list):
         cfg_path = f.name
 
     venv_py = "/workspace/stable-diffusion-webui/venv/bin/python"
-    webui = "/workspace/stable-diffusion-webui"
+    webui   = "/workspace/stable-diffusion-webui"
 
     args = [
         venv_py, os.path.join(webui, "launch.py"),
@@ -145,7 +156,7 @@ def run_via_launch(job: dict, timings: list):
     env = os.environ.copy()
     ckpt = os.getenv("CKPT_PATH") or os.getenv("SD_CKPT_PATH")
     if ckpt:
-        env["SD_WEBUI_RESTARTING"] = "1"   # avoid sticky state
+        env["SD_WEBUI_RESTARTING"] = "1"
         env["COMMANDLINE_ARGS"] = (env.get("COMMANDLINE_ARGS","") + f" --ckpt \"{ckpt}\"").strip()
 
     proc = subprocess.run(args, cwd=webui, env=env,
